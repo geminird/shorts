@@ -1,0 +1,8 @@
+PyQt6>=6.5.0
+mss>=9.0.1
+Pillow>=10.0.0
+numpy>=1.24.0
+pynput>=1.7.0
+pyinstaller>=6.0.0
+# macOS 专属：窗口枚举（Quartz）与系统 API 绑定
+pyobjc>=10.0; sys_platform == "darwin"

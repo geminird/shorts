@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+*.log
+_o.txt
+__test_*.out
