@@ -522,8 +522,11 @@ class _GifAnnotationOverlay(QWidget):
         self.setGeometry(rect)
 
     def showEvent(self, event):
-        """show 后设 native 层鼠标穿透（默认不拦截用户操作）。"""
+        """show 后设 native 层鼠标穿透（仅首次，避免 raise 循环重复设回穿透）。"""
         super().showEvent(event)
+        if getattr(self, "_native_passthrough_set", False):
+            return  # 已经设过了，不重复
+        self._native_passthrough_set = True
         try:
             import sys as _sys, objc
             if _sys.platform == "darwin":
@@ -3275,7 +3278,7 @@ class SelectionWindow(QWidget):
             return result
 
         if self.background_pixmap and self.selection_rect.isValid():
-            # 背景图设了 devicePixelRatio（物理像素 2x），copy 需按物理坐标裁剪
+            # 背景图设了 DPR（物理像素 2x），copy 需按物理坐标裁剪
             dpr = self.background_pixmap.devicePixelRatio() or 1.0
             phys_rect = QRect(
                 round(self.selection_rect.x() * dpr),
@@ -3287,15 +3290,12 @@ class SelectionWindow(QWidget):
             result.setDevicePixelRatio(dpr)
             painter = QPainter(result)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            # 标注坐标是逻辑点，但 result 是物理像素图（设了 DPR）。
-            # scale(dpr,dpr) 让 painter 在逻辑坐标系下绘制，Qt 自动映射到物理像素。
-            painter.scale(dpr, dpr)
+            # QPixmap 设了 DPR：QPainter 自动在逻辑坐标系下绘制，pen/字号正常。
+            # 不需要 painter.scale。
 
-            # 偏移量（逻辑坐标）：标注坐标是全屏的，转换到选区坐标系
             offset_x = self.selection_rect.x()
             offset_y = self.selection_rect.y()
 
-            # 绘制所有标注
             for ann in self.annotations:
                 self._draw_annotation(painter, ann, offset_x, offset_y)
 

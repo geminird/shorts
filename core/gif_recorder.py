@@ -163,17 +163,18 @@ class GifRecorder(QObject):
         bits.setsize(qimg.sizeInBytes())
         pil = Image.frombytes("RGBA", (qimg.width(), qimg.height()), bytes(bits))
         W, H = pil.size
+        DPR = pixmap.devicePixelRatio() or 1.0
         SS = 2
         big = pil.resize((W * SS, H * SS), Image.LANCZOS)
         draw = ImageDraw.Draw(big)
 
         # 画标注
         for ann, alpha in active_anns:
-            self._draw_ann_pil(draw, ann, alpha, SS)
+            self._draw_ann_pil(draw, ann, alpha, SS, DPR)
         # 画预览
         preview = getattr(self, "_preview_ann", None)
         if preview:
-            self._draw_ann_pil(draw, preview, 255, SS)
+            self._draw_ann_pil(draw, preview, 255, SS, DPR)
 
         # 画点击涟漪
         for ts, lx, ly, btn in active_clicks:
@@ -184,7 +185,7 @@ class GifRecorder(QObject):
             eased = 1 - (1 - t) ** 3
             r_main = int((6 + eased * (_CLICK_MAX_R - 6)) * SS)
             r_outer = int((10 + eased * (_CLICK_MAX_R + 8)) * SS)
-            cx, cy = int(lx * SS), int(ly * SS)
+            cx, cy = int(lx * SS * DPR), int(ly * SS * DPR)
             color = (59, 130, 246) if btn == "left" else (251, 146, 60)
             if r_outer > r_main:
                 draw.ellipse([cx - r_outer, cy - r_outer, cx + r_outer, cy + r_outer],
@@ -202,30 +203,29 @@ class GifRecorder(QObject):
         out = QImage(data, W, H, QImage.Format.Format_RGBA8888).copy()
         return QPixmap.fromImage(out)
 
-    def _draw_ann_pil(self, draw, ann, alpha, SS):
-        """用 PIL 绘制单个标注（矩形/箭头），alpha 控制闪烁透明度。"""
+    def _draw_ann_pil(self, draw, ann, alpha, SS, DPR=1.0):
+        """用 PIL 绘制单个标注。坐标是逻辑点，需乘 DPR（物理像素）和 SS（超采样）。"""
         color = ann.get("color", (255, 59, 48, 255))
         r, g, b = color[0], color[1], color[2]
         draw_color = (r, g, b, alpha) if len(color) >= 4 else (r, g, b)
-        w = max(2, int(ann.get("width", 3) * SS))
+        S = SS * DPR  # 总缩放倍率
+        w = max(2, int(ann.get("width", 3) * S))
         tool = ann.get("tool", "")
 
         if tool == "rect":
             rect = ann.get("rect")
             if rect:
-                x0, y0 = int(rect[0] * SS), int(rect[1] * SS)
-                x1, y1 = int(rect[2] * SS), int(rect[3] * SS)
-                # 先画粗 outline，再画内层 outline（确保缩回后仍可见）
+                x0, y0 = int(rect[0] * S), int(rect[1] * S)
+                x1, y1 = int(rect[2] * S), int(rect[3] * S)
                 draw.rectangle([x0-2, y0-2, x1+2, y1+2], outline=(255,255,255,alpha), width=max(4, w+2))
                 draw.rectangle([x0, y0, x1, y1], outline=draw_color, width=max(4, w))
         elif tool == "arrow":
             sp = ann.get("start_pos")
             ep = ann.get("end_pos")
             if sp and ep:
-                sx, sy = int(sp[0] * SS), int(sp[1] * SS)
-                ex, ey = int(ep[0] * SS), int(ep[1] * SS)
+                sx, sy = int(sp[0] * S), int(sp[1] * S)
+                ex, ey = int(ep[0] * S), int(ep[1] * S)
                 draw.line([sx, sy, ex, ey], fill=draw_color, width=w)
-                # 箭头头部（简化：画一个小三角）
                 import math
                 angle = math.atan2(ey - sy, ex - sx)
                 head_len = max(8, w * 3)
