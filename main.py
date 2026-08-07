@@ -133,15 +133,9 @@ def _rgba_bytes_to_gray_np(data, W, H, ds=4):
 def _find_scroll_overlap_np(prev_bytes, new_bytes, W, Hp, Hn):
     """基于归一化互相关(NCC)求相邻两帧的重叠行数。
 
-    滚动后，"上一帧底部 band_h 行"会重新出现在"新帧"中。取上一帧底带作模板，
-    在新帧中滑动搜索其最佳匹配位置 best_pos（NCC 最大）。匹配时：
-        new[best_pos : best_pos+band_h] ≈ prev[h_p-band_h : h_p]
-    即 new 第 best_pos 行 == prev 第 (h_p-band_h) 行(均为降采样坐标)。
-    两帧坐标偏移 = (h_p-band_h) - best_pos（prev 比 new 早这么多 ds 行 = 滚动量）。
-    故：滚动像素 = ((h_p-band_h) - best_pos) * ds；重叠像素 = H - 滚动像素。
-
     用较小的降采样(ds=2)保留文字纹理；band_h 取帧高 1/3 增大区分度。NCC 阈值
     0.5（真实滚动帧的 NCC 通常 >0.7，但平滑滚动有亚像素扰动，留余量）。
+    NCC 粗匹配后用像素精确匹配在 ±5 行范围微调（消除降采样误差）。
     """
     import numpy as np
     ds = 2
@@ -150,14 +144,13 @@ def _find_scroll_overlap_np(prev_bytes, new_bytes, W, Hp, Hn):
     h_p, w = prev.shape
     h_n, _ = new.shape
 
-    # 模板：上一帧底部 band_h 行（适中窗口，过大会退化为整帧匹配找最像位置）
     band_h = max(16, min(h_n // 4, 80))
     if band_h >= h_n or band_h >= h_p or w < 4:
         return 0
     template = prev[h_p - band_h:h_p].astype(np.float64)
     t_std = template.std()
     if t_std < 1e-6:
-        return 0  # 模板近纯色，无法可靠匹配
+        return 0
     t_norm = (template - template.mean()) / t_std
 
     best_ncc = -1.0
@@ -175,13 +168,31 @@ def _find_scroll_overlap_np(prev_bytes, new_bytes, W, Hp, Hn):
 
     if best_ncc < 0.5 or best_pos < 0:
         return 0
-    # 滚动像素 = (prev 底带起点 - 它在 new 中的位置) * ds
     scroll_px = ((h_p - band_h) - best_pos) * ds
     if scroll_px <= 0:
-        # 滚动量 ~0：两帧几乎相同，重叠≈整帧（几乎全重复，几乎不追加新内容）
         return max(0, Hp - 1)
     overlap = Hp - scroll_px
-    return max(0, min(overlap, Hp))
+    overlap = max(0, min(overlap, Hp))
+
+    # 像素精确微调：在 overlap±5 行范围用全帧 SAD 找精确值
+    if overlap > 10 and overlap < Hp - 5:
+        row_size_phys = W * 4
+        pa = np.frombuffer(prev_bytes, dtype=np.uint8).astype(np.int32).reshape(Hp, W, 4)
+        na = np.frombuffer(new_bytes, dtype=np.uint8).astype(np.int32).reshape(Hn, W, 4)
+        best_ov = overlap
+        best_diff = float('inf')
+        for try_ov in range(max(1, overlap - 5), min(Hp, overlap + 6)):
+            # prev 底部 try_ov 行 vs new 顶部 try_ov 行
+            pt = pa[Hp - try_ov:]
+            nt = na[:try_ov]
+            if pt.shape == nt.shape:
+                diff = np.abs(pt - nt).sum()
+                if diff < best_diff:
+                    best_diff = diff
+                    best_ov = try_ov
+        overlap = best_ov
+
+    return overlap
 
 
 
@@ -245,9 +256,34 @@ def _stitch_images(images):
             sigs[i - 1], sigs[i], prev_h, new_h,
             prev_bytes, new_bytes, W, col_stride
         )
-        # 追加新帧中"重叠行"之后的新内容
-        result_bytes.extend(new_bytes[ov * row_size:])
-        result_h += (new_h - ov)
+        keep = new_h - ov
+        if keep < 5:
+            continue
+        # 拼接处渐变混合（消除亚像素偏移导致的黑线/错位）：
+        # 在 ov 行前 4 行做线性过渡，从 prev 内容渐变到 new 内容
+        blend_rows = min(4, ov // 2)
+        if blend_rows > 0 and ov > blend_rows:
+            import numpy as np
+            blend_start = ov - blend_rows
+            # prev 底部 blend_rows 行（已在 result 中）
+            prev_tail_start = len(result_bytes) - blend_rows * row_size
+            prev_tail = np.frombuffer(
+                bytes(result_bytes[prev_tail_start:]), dtype=np.uint8).astype(np.int32)
+            # new 对应的行
+            new_blend = np.frombuffer(
+                new_bytes[blend_start * row_size : ov * row_size],
+                dtype=np.uint8).astype(np.int32)
+            if len(prev_tail) == len(new_blend):
+                # 线性混合：alpha 从 1.0(prev) 渐变到 0.0(new)
+                for br in range(blend_rows):
+                    a = 1.0 - br / blend_rows  # 1.0 → 0.0
+                    s = br * row_size
+                    e = (br + 1) * row_size
+                    mixed = (prev_tail[s:e] * a + new_blend[s:e] * (1 - a)).astype(np.uint8)
+                    result_bytes[prev_tail_start + s : prev_tail_start + e] = mixed.tobytes()
+        # 追加 new 中重叠行之后的新内容（跳过第 0 行——可能是截图边缘伪影）
+        result_bytes.extend(new_bytes[(ov + 1) * row_size:])
+        result_h += (new_h - ov - 1)
 
     return QImage(
         bytes(result_bytes), W, result_h, row_size, QImage.Format.Format_RGBA8888
@@ -595,6 +631,7 @@ class _GifAnnotationOverlay(QWidget):
             end = event.pos()
             # 清除预览
             self._recorder._preview_ann = None
+            added = False
             if self._tool == "rect":
                 x0, y0 = min(self._start.x(), end.x()), min(self._start.y(), end.y())
                 x1, y1 = max(self._start.x(), end.x()), max(self._start.y(), end.y())
@@ -605,6 +642,7 @@ class _GifAnnotationOverlay(QWidget):
                         "color": (self._color.red(), self._color.green(), self._color.blue(), 255),
                         "width": 3,
                     })
+                    added = True
             elif self._tool == "arrow":
                 dx = end.x() - self._start.x()
                 dy = end.y() - self._start.y()
@@ -616,6 +654,10 @@ class _GifAnnotationOverlay(QWidget):
                         "color": (self._color.red(), self._color.green(), self._color.blue(), 255),
                         "width": 3,
                     })
+                    added = True
+            # 如果画了标注，通知 SelectionWindow 显示"闪烁中"提示
+            if added and hasattr(self, "_on_ann_added") and self._on_ann_added:
+                self._on_ann_added()
             self._tool = None  # 画完恢复穿透
             self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
@@ -3891,6 +3933,7 @@ class SelectionWindow(QWidget):
             # 透明标注覆盖层（必须在 _make_record_bar 之前创建，bar 的按钮要引用它）
             self._gif_ann_overlay = _GifAnnotationOverlay(
                 self._gif_rect, self._gif_recorder)
+            self._gif_ann_overlay._on_ann_added = self._on_gif_ann_added
             self._gif_ann_overlay.show()
             make_floating_panel(self._gif_ann_overlay)
             # 录制浮窗（含标注工具按钮，引用 overlay）
@@ -3964,6 +4007,21 @@ class SelectionWindow(QWidget):
         ov = getattr(self, "_gif_ann_overlay", None)
         if ov is not None:
             ov._color = QColor(color)
+
+    def _on_gif_ann_added(self):
+        """标注画完后：状态面板显示"闪烁中"提示，1.8 秒后恢复。"""
+        if self._gif_status:
+            self._gif_status.setText("⏳ 标注闪烁中…请稍候")
+            self._gif_status.setStyleSheet("color:#ffcc00; font-size:12px;")
+        QTimer.singleShot(1800, self._restore_gif_status)
+
+    def _restore_gif_status(self):
+        """恢复录制状态面板的帧数显示。"""
+        if self._gif_status:
+            count = len(getattr(self, "_gif_frame_files", []))
+            secs = count / 12
+            self._gif_status.setText(f"● 录制中 {secs:.0f}s ({count} 帧)")
+            self._gif_status.setStyleSheet("color:#ff453a; font-size:12px;")
 
     def _make_record_bar(self):
         """录制中的浮窗（停止按钮 + 帧数 + 显示点击开关）。"""
@@ -4057,15 +4115,25 @@ class SelectionWindow(QWidget):
                     rec._clicks.clear()
 
     def _on_gif_frame(self, pm):
-        """收到一帧 QPixmap（主线程 QTimer 内传递，无跨线程问题）。"""
-        self._gif_frames.append(pm)
+        """收到一帧 QPixmap：写 PNG 到临时目录（不存内存，避免内存爆炸）。"""
+        if not hasattr(self, "_gif_tmpdir") or self._gif_tmpdir is None:
+            import tempfile
+            self._gif_tmpdir = tempfile.mkdtemp(prefix="shorts_gif_")
+        idx = len(self._gif_frame_files) if hasattr(self, "_gif_frame_files") else 0
+        if not hasattr(self, "_gif_frame_files"):
+            self._gif_frame_files = []
+        path = f"{self._gif_tmpdir}/frame_{idx:05d}.png"
+        pm.save(path, "PNG")
+        self._gif_frame_files.append(path)
         if self._gif_status:
-            self._gif_status.setText(f"● 录制中 {len(self._gif_frames)} 帧")
-        if len(self._gif_frames) >= 360:
+            secs = len(self._gif_frame_files) / 12
+            self._gif_status.setText(f"● 录制中 {secs:.0f}s ({len(self._gif_frame_files)} 帧)")
+        # 不再限制 360 帧（磁盘存储，内存不爆炸）。限制 5 分钟 = 3600 帧
+        if len(self._gif_frame_files) >= 3600:
             self._stop_gif_record()
 
     def _stop_gif_record(self):
-        """停止录制，存成 GIF。"""
+        """停止录制，选格式保存（GIF / MP4）。"""
         timer = getattr(self, "_gif_raise_timer", None)
         if timer is not None:
             timer.stop()
@@ -4074,13 +4142,11 @@ class SelectionWindow(QWidget):
         if rec is not None:
             rec.stop()
             rec.stop_tap()
-        # 关闭选区高亮遮罩
         outline = getattr(self, "_gif_outline", None)
         if outline is not None:
             outline.close()
             outline.deleteLater()
             self._gif_outline = None
-        # 关闭标注覆盖层
         ann_ov = getattr(self, "_gif_ann_overlay", None)
         if ann_ov is not None:
             ann_ov.close()
@@ -4090,27 +4156,124 @@ class SelectionWindow(QWidget):
             self._gif_bar.close()
             self._gif_bar.deleteLater()
             self._gif_bar = None
-        frames = self._gif_frames or []
-        if not frames:
+        frame_files = getattr(self, "_gif_frame_files", [])
+        if not frame_files:
             self.show()
             self._show_toolbar()
             return
-        tip = self._show_float_tip("生成 GIF 中…", 0)
+        tip = self._show_float_tip("选择保存格式…", 0)
         QApplication.processEvents()
         try:
-            from core.gif_recorder import frames_to_gif
-            from PyQt6.QtWidgets import QFileDialog
-            # 默认保存到桌面
-            desktop = QFileDialog.getSaveFileName(
-                self, "保存 GIF", "recording.gif", "GIF Files (*.gif)")[0]
-            if desktop:
-                ok = frames_to_gif(frames, desktop, fps=12)
+            from PyQt6.QtWidgets import QFileDialog, QMessageBox
+            # 先让用户选格式
+            fmt_box = QMessageBox(self)
+            fmt_box.setWindowTitle("保存录制")
+            secs = len(frame_files) / 12
+            fmt_box.setText(f"录制完成：{len(frame_files)} 帧（{secs:.0f} 秒）\n选择保存格式：")
+            gif_btn = fmt_box.addButton("GIF", QMessageBox.ButtonRole.AcceptRole)
+            mp4_btn = fmt_box.addButton("MP4（体积更小）", QMessageBox.ButtonRole.AcceptRole)
+            cancel_btn = fmt_box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+            fmt_box.exec()
+            clicked = fmt_box.clickedButton()
+            if clicked == cancel_btn or clicked is None:
+                if tip is not None:
+                    tip.close()
+                self._cleanup_gif_tmp()
+                self._gif_frame_files = []
+                self.close()
+                self.finished.emit()
+                return
+            use_mp4 = (clicked == mp4_btn)
+            default_name = "recording.mp4" if use_mp4 else "recording.gif"
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "保存", default_name,
+                "MP4 (*.mp4)" if use_mp4 else "GIF (*.gif)")
+            if not file_path:
+                if tip is not None:
+                    tip.close()
+                self._cleanup_gif_tmp()
+                self._gif_frame_files = []
+                self.close()
+                self.finished.emit()
+                return
+            if use_mp4:
+                import subprocess
+                tmpdir = self._gif_tmpdir
+                # 用完整路径找 ffmpeg（.app 环境 PATH 可能不同）
+                import shutil as _sh
+                ffmpeg_path = _sh.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg" or "/usr/local/bin/ffmpeg"
+                cmd = [ffmpeg_path, "-y", "-framerate", "12",
+                       "-i", f"{tmpdir}/frame_%05d.png",
+                       "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                       "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                       file_path]
+                # 进度对话框
+                from PyQt6.QtWidgets import QProgressDialog
+                prog = QProgressDialog("正在生成 MP4…", "取消", 0, 100, self)
+                prog.setWindowModality(Qt.WindowModality.WindowModal)
+                prog.setMinimumDuration(0)
+                prog.setAutoClose(False)
+                prog.setValue(10)
+                QApplication.processEvents()
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                # 读 stderr 的 frame= 进度（ffmpeg 输出到 stderr）
+                import re
+                while proc.poll() is None:
+                    line = proc.stderr.readline()
+                    if not line:
+                        break
+                    m = re.search(r'frame=\s*(\d+)', line)
+                    if m:
+                        done = int(m.group(1))
+                        pct = min(99, int(done / max(1, len(frame_files)) * 100))
+                        prog.setValue(pct)
+                        QApplication.processEvents()
+                proc.wait(timeout=60)
+                prog.setValue(100)
+                prog.close()
+                if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                    self._show_float_tip(f"已保存 MP4：{file_path}", 2500)
+                else:
+                    err = proc.stderr.read()[-200:] if proc.stderr else ""
+                    self._show_float_tip(f"MP4 失败：{err}", 3000)
+            else:
+                tip.setText("  正在生成 GIF…  ")
+                QApplication.processEvents()
+                # GIF 生成也加进度
+                from PyQt6.QtWidgets import QProgressDialog
+                prog = QProgressDialog("正在生成 GIF…", None, 0, 100, self)
+                prog.setWindowModality(Qt.WindowModality.WindowModal)
+                prog.setMinimumDuration(0)
+                prog.setValue(20)
+                QApplication.processEvents()
+                from core.gif_recorder import frames_from_files_to_gif
+                ok = frames_from_files_to_gif(frame_files, file_path, fps=12)
+                prog.setValue(100)
+                prog.close()
                 if ok:
-                    self._show_float_tip(f"已保存：{desktop}", 2500)
+                    self._show_float_tip(f"已保存 GIF：{file_path}", 2500)
+                else:
+                    self._show_float_tip("GIF 生成失败", 2500)
         except Exception as e:
             self._show_float_tip(f"生成失败: {e}", 2500)
         if tip is not None:
             tip.close()
+        # 清理临时文件
+        self._cleanup_gif_tmp()
+        self._gif_frame_files = []
+        self.close()
+        self.finished.emit()
+
+    def _cleanup_gif_tmp(self):
+        """清理 GIF 录制的临时 PNG 文件。"""
+        import shutil
+        tmpdir = getattr(self, "_gif_tmpdir", None)
+        if tmpdir:
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+            self._gif_tmpdir = None
         self._gif_frames = []
         self.close()
         self.finished.emit()

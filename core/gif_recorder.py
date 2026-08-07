@@ -235,6 +235,19 @@ class GifRecorder(QObject):
                     draw.line([ex, ey, int(hx), int(hy)], fill=draw_color, width=w)
 
 
+def frames_from_files_to_gif(file_paths, output_path, fps=12):
+    """从磁盘 PNG 文件列表编码 GIF（不在内存存所有帧）。"""
+    if not file_paths:
+        return False
+    from PIL import Image
+    duration = max(1, round(1000 / fps))
+    first = Image.open(file_paths[0]).convert("RGB")
+    rest = [Image.open(f).convert("RGB") for f in file_paths[1:]]
+    first.save(output_path, save_all=True, append_images=rest,
+               duration=duration, loop=0, disposal=1, optimize=False)
+    return True
+
+
 def frames_to_gif(frames, path, fps=12):
     """把 QPixmap 列表存成 GIF。"""
     if not frames:
