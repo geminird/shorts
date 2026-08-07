@@ -1,27 +1,39 @@
 """截图核心模块（跨平台）。
 
-基于 mss 抓屏。所有坐标统一用 Qt 逻辑点（与 QScreen.geometry() / CGWindowBounds
-一致）。返回的 QPixmap **不设 devicePixelRatio**（保持 mss 默认的 1:1，逻辑像素图），
-这样 QPixmap.copy(QRect) 按逻辑坐标裁剪即为正确区域，不会因 DPR 换算偏移。
+macOS：设 mss.darwin.IMAGE_OPTIONS = 0，使 grab 返回 Retina 2x 物理像素图
+（清晰）。输入坐标仍用逻辑点（与 QScreen.geometry / CGWindowBounds 一致），
+返回的 QPixmap 设 devicePixelRatio=DPR，使 Qt 自动处理逻辑↔物理坐标映射。
 
-- macOS：使用 mss 默认行为（返回逻辑像素 1x 图）。坐标原点在主屏左上，与
-  CGWindowList 一致。清晰度虽为 1x（文字略软），但坐标/裁剪完全正确——这是
-  跨平台最稳的选择。若后续要 Retina 清晰度，应在导出时按 DPR 上采样，而非在
-  截取阶段引入 IMAGE_OPTIONS=0（会让 mss 的 monitors/grab 坐标系错乱）。
-- Windows：行为与改造前一致。
+坐标体系：
+- 所有 capture_* 的输入参数 = 逻辑点（Qt 坐标）
+- mss grab 在 IMAGE_OPTIONS=0 下：输入逻辑点，输出物理像素 2x
+- 返回的 QPixmap 设了 devicePixelRatio=DPR
+- QPixmap.copy(QRect) 会自动按 DPR 换算（Qt 6 行为：逻辑坐标 → 物理裁剪）
+- QPixmap.size() 返回逻辑尺寸（物理/DPR）
+
+Windows：DPR 通常 1.0，行为不变。
 """
 import mss
 from PIL import Image
 from PyQt6.QtGui import QImage, QPixmap
 
-from utils.platform import is_macos
+from utils.platform import is_macos, device_pixel_ratio
+
+
+# macOS：设 IMAGE_OPTIONS=0 强制 Retina 2x 物理像素（清晰）
+if is_macos():
+    try:
+        from mss import darwin as _mss_darwin
+        _mss_darwin.IMAGE_OPTIONS = 0
+    except Exception:
+        pass
 
 
 class Screenshot:
     """截图管理器"""
 
     def __init__(self):
-        pass
+        self._dpr = device_pixel_ratio()
 
     def get_monitors(self):
         """获取所有显示器信息（逻辑点坐标）。"""
@@ -31,8 +43,8 @@ class Screenshot:
     def capture_full_screen(self, monitor_index=1):
         """截取整个屏幕。
 
-        monitor_index=0 = mss 的“所有显示器合并”虚拟屏。
-        返回逻辑像素 QPixmap（devicePixelRatio=1，按逻辑坐标裁剪即可）。
+        monitor_index=0 = mss 的"所有显示器合并"虚拟屏。
+        返回的 QPixmap 设了 devicePixelRatio，drawPixmap/copy 按 Qt 逻辑坐标操作。
         """
         with mss.mss() as sct:
             monitor = sct.monitors[monitor_index]
@@ -52,13 +64,16 @@ class Screenshot:
             return self._grab_to_pixmap(screenshot)
 
     def _grab_to_pixmap(self, screenshot):
-        """将 mss grab 转换为 QPixmap。"""
-        # mss 返回的是 BGRA 格式
+        """将 mss grab 转换为 QPixmap，设 devicePixelRatio。"""
         img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
         img = img.convert("RGBA")
 
         data = img.tobytes("raw", "RGBA")
         qimage = QImage(data, img.width, img.height, QImage.Format.Format_RGBA8888)
-        # 不设 devicePixelRatio：mss 返回逻辑像素图，1:1 对应屏幕逻辑坐标，
-        # QPixmap.copy(QRect) 直接按逻辑坐标裁剪即正确。
-        return QPixmap.fromImage(qimage)
+        pixmap = QPixmap.fromImage(qimage)
+        # 设 devicePixelRatio：让 Qt 知道物理像素/逻辑点的比值。
+        # 这样 QPixmap.copy(逻辑 QRect) 自动按 DPR 换算到物理坐标裁剪，
+        # drawPixmap 自动缩放到逻辑尺寸显示。
+        if self._dpr != 1.0:
+            pixmap.setDevicePixelRatio(self._dpr)
+        return pixmap

@@ -493,6 +493,164 @@ def _thread_sleep(seconds):
     time.sleep(seconds)
 
 
+class _GifAnnotationOverlay(QWidget):
+    """GIF 录制中的透明标注覆盖层。
+
+    覆盖录制选区，接收鼠标事件让用户画矩形/箭头标注。
+    默认鼠标穿透（不影响用户操作目标应用），选了标注工具后变为可交互。
+    画完的标注通过 GifRecorder.add_annotation 存入列表，叠加到每一帧。
+    """
+
+    def __init__(self, rect, recorder):
+        super().__init__()
+        self._rect = QRect(rect)
+        self._recorder = recorder
+        self._tool = None  # "rect" / "arrow" / None
+        self._color = QColor(255, 59, 48)
+        self._start = QPoint()
+        self._current = QPoint()
+        self._drawing = False
+
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)  # 默认穿透
+        self.setGeometry(rect)
+
+    def showEvent(self, event):
+        """show 后设 native 层鼠标穿透（默认不拦截用户操作）。"""
+        super().showEvent(event)
+        try:
+            import sys as _sys, objc
+            if _sys.platform == "darwin":
+                wid = int(self.winId())
+                if wid:
+                    ns_win = objc.objc_object(c_void_p=wid).window()
+                    if ns_win is not None:
+                        ns_win.setIgnoresMouseEvents_(True)
+        except Exception:
+            pass
+
+    def set_tool(self, tool):
+        """切换工具：None=穿透（不影响用户操作），rect/arrow=可绘制。"""
+        self._tool = tool
+        # 同时操作 Qt 层 + macOS native 层（NSWindow.setIgnoresMouseEvents）
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, tool is None)
+        try:
+            import sys as _sys, objc
+            if _sys.platform == "darwin":
+                wid = int(self.winId())
+                if wid:
+                    ns_win = objc.objc_object(c_void_p=wid).window()
+                    if ns_win is not None:
+                        ns_win.setIgnoresMouseEvents_(tool is None)
+        except Exception:
+            pass
+        if tool is not None:
+            self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._tool:
+            self._drawing = True
+            self._start = event.pos()
+            self._current = event.pos()
+            self._update_preview()
+
+    def mouseMoveEvent(self, event):
+        if self._drawing:
+            self._current = event.pos()
+            self._update_preview()
+            self.update()  # 触发 paintEvent 实时预览
+
+    def _update_preview(self):
+        """把绘制中的标注推给 recorder（GIF 帧预览）+ 触发自身重绘（实时预览）。"""
+        if not self._drawing or not self._tool:
+            return
+        color = (self._color.red(), self._color.green(), self._color.blue(), 255)
+        if self._tool == "rect":
+            x0, y0 = min(self._start.x(), self._current.x()), min(self._start.y(), self._current.y())
+            x1, y1 = max(self._start.x(), self._current.x()), max(self._start.y(), self._current.y())
+            self._recorder._preview_ann = {
+                "tool": "rect", "rect": (x0, y0, x1, y1),
+                "color": color, "width": 3,
+            }
+        elif self._tool == "arrow":
+            self._recorder._preview_ann = {
+                "tool": "arrow",
+                "start_pos": (self._start.x(), self._start.y()),
+                "end_pos": (self._current.x(), self._current.y()),
+                "color": color, "width": 3,
+            }
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._drawing:
+            self._drawing = False
+            end = event.pos()
+            # 清除预览
+            self._recorder._preview_ann = None
+            if self._tool == "rect":
+                x0, y0 = min(self._start.x(), end.x()), min(self._start.y(), end.y())
+                x1, y1 = max(self._start.x(), end.x()), max(self._start.y(), end.y())
+                if x1 - x0 > 3 and y1 - y0 > 3:
+                    self._recorder.add_annotation({
+                        "tool": "rect",
+                        "rect": (x0, y0, x1, y1),
+                        "color": (self._color.red(), self._color.green(), self._color.blue(), 255),
+                        "width": 3,
+                    })
+            elif self._tool == "arrow":
+                dx = end.x() - self._start.x()
+                dy = end.y() - self._start.y()
+                if dx * dx + dy * dy > 25:
+                    self._recorder.add_annotation({
+                        "tool": "arrow",
+                        "start_pos": (self._start.x(), self._start.y()),
+                        "end_pos": (end.x(), end.y()),
+                        "color": (self._color.red(), self._color.green(), self._color.blue(), 255),
+                        "width": 3,
+                    })
+            self._tool = None  # 画完恢复穿透
+            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+            # native 层也恢复穿透
+            try:
+                import sys as _sys, objc
+                if _sys.platform == "darwin":
+                    wid = int(self.winId())
+                    if wid:
+                        ns_win = objc.objc_object(c_void_p=wid).window()
+                        if ns_win is not None:
+                            ns_win.setIgnoresMouseEvents_(True)
+            except Exception:
+                pass
+            self.update()
+
+    def paintEvent(self, event):
+        """绘制正在画中的标注预览。"""
+        if not self._drawing or not self._tool:
+            return
+        painter = QPainter(self)
+        pen = QPen(self._color, 3)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if self._tool == "rect":
+            painter.drawRect(QRect(self._start, self._current).normalized())
+        elif self._tool == "arrow":
+            painter.drawLine(self._start, self._current)
+            # 简易箭头头
+            import math
+            angle = math.atan2(self._current.y() - self._start.y(),
+                               self._current.x() - self._start.x())
+            for da in [-0.5, 0.5]:
+                hx = self._current.x() - 12 * math.cos(angle + da)
+                hy = self._current.y() - 12 * math.sin(angle + da)
+                painter.drawLine(self._current, QPoint(int(hx), int(hy)))
+
+
 class SelectionWindow(QWidget):
     """截图选区窗口 - 沉浸式十字光标选区 + 标注"""
     finished = pyqtSignal()  # 窗口关闭信号
@@ -3117,13 +3275,23 @@ class SelectionWindow(QWidget):
             return result
 
         if self.background_pixmap and self.selection_rect.isValid():
-            # 背景图是逻辑像素图（devicePixelRatio=1），选区也是逻辑坐标，
-            # QPixmap.copy(QRect) 直接按逻辑坐标裁剪即可。
-            result = QPixmap(self.background_pixmap.copy(self.selection_rect))
+            # 背景图设了 devicePixelRatio（物理像素 2x），copy 需按物理坐标裁剪
+            dpr = self.background_pixmap.devicePixelRatio() or 1.0
+            phys_rect = QRect(
+                round(self.selection_rect.x() * dpr),
+                round(self.selection_rect.y() * dpr),
+                round(self.selection_rect.width() * dpr),
+                round(self.selection_rect.height() * dpr),
+            )
+            result = QPixmap(self.background_pixmap.copy(phys_rect))
+            result.setDevicePixelRatio(dpr)
             painter = QPainter(result)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            # 标注坐标是逻辑点，但 result 是物理像素图（设了 DPR）。
+            # scale(dpr,dpr) 让 painter 在逻辑坐标系下绘制，Qt 自动映射到物理像素。
+            painter.scale(dpr, dpr)
 
-            # 计算偏移量 - 标注坐标是相对于全屏的，需要转换到选区坐标系
+            # 偏移量（逻辑坐标）：标注坐标是全屏的，转换到选区坐标系
             offset_x = self.selection_rect.x()
             offset_y = self.selection_rect.y()
 
@@ -3694,6 +3862,12 @@ class SelectionWindow(QWidget):
 
     def _start_gif_record(self):
         """开始录制 GIF：隐藏选区窗口 + 工具栏，显示录制浮窗，子线程抓帧。"""
+        try:
+            import pathlib
+            pathlib.Path("/tmp/gif_debug.log").write_text(
+                f"start_gif: rect={self.selection_rect}\n", encoding="utf-8")
+        except Exception:
+            pass
         if not self.selection_rect.isValid():
             return
         from core.gif_recorder import GifRecorder
@@ -3705,23 +3879,47 @@ class SelectionWindow(QWidget):
         # 隐藏自身 + 浮层
         self._close_overlays()
         self.hide()
-        # 显示选区高亮遮罩（选区外半透明黑色 + 蓝色边框，复用滚动截图遮罩）
-        self._gif_outline = _ScrollDimOverlay(self._gif_rect)
-        self._gif_outline.show()
-        make_mouse_passthrough(self._gif_outline)
-        make_floating_panel(self._gif_outline)
-        # 录制浮窗
-        self._gif_bar = self._make_record_bar()
-        self._gif_bar.show()
-        # 让出焦点给目标应用（用户操作时才能录到）
+        try:
+            # 显示选区高亮遮罩
+            self._gif_outline = _ScrollDimOverlay(self._gif_rect)
+            self._gif_outline.show()
+            make_mouse_passthrough(self._gif_outline)
+            make_floating_panel(self._gif_outline)
+            # 先创建 recorder
+            self._gif_recorder = GifRecorder(self._gif_rect, fps=12, show_clicks=self._gif_show_clicks)
+            self._gif_recorder.frame_captured.connect(self._on_gif_frame)
+            # 透明标注覆盖层（必须在 _make_record_bar 之前创建，bar 的按钮要引用它）
+            self._gif_ann_overlay = _GifAnnotationOverlay(
+                self._gif_rect, self._gif_recorder)
+            self._gif_ann_overlay.show()
+            make_floating_panel(self._gif_ann_overlay)
+            # 录制浮窗（含标注工具按钮，引用 overlay）
+            self._gif_bar = self._make_record_bar()
+            self._gif_bar.show()
+        except Exception as e:
+            import traceback
+            try:
+                import pathlib
+                pathlib.Path("/tmp/gif_debug.log").write_text(
+                    f"EXCEPTION: {e}\n{traceback.format_exc()}", encoding="utf-8")
+            except Exception:
+                pass
+            print(f"GIF 录制启动失败: {e}")
+            traceback.print_exc()
+            self.show()
+            return
+        # 让出焦点
         activate_foreground_app()
-        # 启动子线程抓帧
-        self._gif_recorder = GifRecorder(self._gif_rect, fps=12, show_clicks=self._gif_show_clicks)
-        self._gif_recorder.frame_captured.connect(self._on_gif_frame)
+        # 启动抓帧
         self._gif_recorder.start()
-        # 录制期间持续保持浮窗置顶（macOS 没有真正的"始终置顶"属性，
-        # 切换 app 时 z-order 会变；只能高频重新提到最前）
         QTimer.singleShot(300, self._start_gif_raise_loop)
+        try:
+            import pathlib
+            p = pathlib.Path("/tmp/gif_debug.log")
+            prev = p.read_text(encoding="utf-8") if p.exists() else ""
+            p.write_text(prev + f"OK bar_pos=({self._gif_bar.x()},{self._gif_bar.y()})\n", encoding="utf-8")
+        except Exception:
+            pass
 
     def _start_gif_raise_loop(self):
         """初始设浮动面板 + 启动高频保持置顶。"""
@@ -3744,7 +3942,7 @@ class SelectionWindow(QWidget):
                 from PyQt6.QtGui import QGuiApplication
                 if QGuiApplication.platformName() == "cocoa":
                     # 先 raise 遮罩（底层），再 raise 面板（浮在遮罩之上）
-                    for w in (outline, bar):
+                    for w in (outline, getattr(self, "_gif_ann_overlay", None), bar):
                         if w is None or not w.isVisible():
                             continue
                         wid = int(w.winId())
@@ -3761,29 +3959,72 @@ class SelectionWindow(QWidget):
         if bar is not None and bar.isVisible():
             bar.raise_()
 
+    def _set_gif_ann_color(self, color):
+        """设置 GIF 标注颜色。"""
+        ov = getattr(self, "_gif_ann_overlay", None)
+        if ov is not None:
+            ov._color = QColor(color)
+
     def _make_record_bar(self):
         """录制中的浮窗（停止按钮 + 帧数 + 显示点击开关）。"""
         bar = QFrame()
         bar.setWindowFlags(overlay_window_flags())
         bar.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        bar.setFixedSize(200, 40)
+        bar.setFixedHeight(40)
         bar.setStyleSheet("""
             QFrame { background-color: rgba(35,35,35,240); border-radius:8px; }
             QLabel { color:#ff453a; font-size:12px; }
-            QPushButton { background-color:#ff453a; color:white; border:none;
-                border-radius:4px; padding:4px 12px; font-size:12px; }
+            QPushButton { background-color:transparent; color:#ddd; border:none;
+                border-radius:4px; padding:4px 8px; font-size:11px; }
+            QPushButton:hover { background-color:rgba(255,255,255,32); }
+            QPushButton[active="true"] { background-color:#0a84ff; color:white; }
         """)
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(12, 4, 12, 4)
         self._gif_status = QLabel("● 录制中 0 帧")
-        stop_btn = QPushButton("停止")
-        stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        stop_btn.clicked.connect(self._stop_gif_record)
         lay.addWidget(self._gif_status)
         lay.addStretch()
+
+        # 标注工具按钮
+        overlay = self._gif_ann_overlay
+        rect_btn = QPushButton("▭")
+        rect_btn.setToolTip("画矩形标注（闪烁后自动消失）")
+        rect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        rect_btn.clicked.connect(lambda: overlay.set_tool("rect"))
+        lay.addWidget(rect_btn)
+
+        arrow_btn = QPushButton("→")
+        arrow_btn.setToolTip("画箭头标注（闪烁后自动消失）")
+        arrow_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        arrow_btn.clicked.connect(lambda: overlay.set_tool("arrow"))
+        lay.addWidget(arrow_btn)
+
+        # 颜色选择（红/黄/绿 三色快速切换）
+        for c, name in [(QColor(255,59,48), "红"), (QColor(255,200,0), "黄"), (QColor(50,200,50), "绿")]:
+            cb = QPushButton()
+            cb.setFixedSize(16, 16)
+            cb.setStyleSheet(f"background-color:{c.name()};border-radius:8px;border:1px solid #888;")
+            cb.setToolTip(f"{name}色")
+            cb.setCursor(Qt.CursorShape.PointingHandCursor)
+            cb.clicked.connect(lambda checked, col=c: self._set_gif_ann_color(col))
+            lay.addWidget(cb)
+
+        # 分隔
+        sep = QFrame()
+        sep.setFixedSize(1, 24)
+        sep.setStyleSheet("background-color:#555;")
+        lay.addWidget(sep)
+
+        stop_btn = QPushButton("停止")
+        stop_btn.setStyleSheet("background-color:#ff453a;color:white;")
+        stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        stop_btn.clicked.connect(self._stop_gif_record)
         lay.addWidget(stop_btn)
+
+        bar.adjustSize()
         # 自适应定位：紧贴选区边缘，不遮挡录制内容
-        bar_w, bar_h = 200, 40
+        bar_w = bar.width()
+        bar_h = 40
         gap = 8  # 与选区边缘的间距
         r = self._gif_rect  # 选区矩形（屏幕坐标）
         scr = QGuiApplication.screenAt(r.center()) or QApplication.primaryScreen()
@@ -3839,6 +4080,12 @@ class SelectionWindow(QWidget):
             outline.close()
             outline.deleteLater()
             self._gif_outline = None
+        # 关闭标注覆盖层
+        ann_ov = getattr(self, "_gif_ann_overlay", None)
+        if ann_ov is not None:
+            ann_ov.close()
+            ann_ov.deleteLater()
+            self._gif_ann_overlay = None
         if self._gif_bar:
             self._gif_bar.close()
             self._gif_bar.deleteLater()

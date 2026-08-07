@@ -11,8 +11,12 @@ from PyQt6.QtCore import QObject, pyqtSignal, QRect, QPointF, QTimer
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QFont
 
 
-_CLICK_TTL = 1.0    # 涟漪持续 1 秒（约 12 帧 @12fps）
-_CLICK_MAX_R = 50   # 最大半径
+_CLICK_TTL = 1.0    # 涟漪持续 1 秒
+_CLICK_MAX_R = 50
+
+# 瞬时标注参数
+_ANN_TTL = 2.0      # 标注存活 2 秒
+_ANN_BLINK_COUNT = 5  # 闪烁 5 次
 
 
 class GifRecorder(QObject):
@@ -31,6 +35,15 @@ class GifRecorder(QObject):
         # 点击记录
         self._clicks = []
         self._prev_buttons = 0
+        # 瞬时标注列表：[(timestamp, {tool, rect/start_pos/end_pos, color, width, text})]
+        self._annotations = []
+        # 当前绘制中的标注状态
+        self._ann_tool = None       # "rect" / "arrow" / None
+        self._ann_color = (255, 59, 48, 255)  # RGBA
+        self._ann_width = 3
+        self._ann_start = None      # QPoint
+        self._ann_current = None    # QPoint（绘制预览用）
+        self._ann_drawing = False
 
     def start(self):
         from core.screenshot import Screenshot
@@ -44,7 +57,24 @@ class GifRecorder(QObject):
         self._running = False
         if self._timer:
             self._timer.stop()
-            self._timer = None
+
+    # ---------- 瞬时标注管理 ----------
+
+    def set_tool(self, tool):
+        """设置当前标注工具: "rect" / "arrow" / None。"""
+        self._ann_tool = tool
+
+    def set_color(self, rgba_tuple):
+        self._ann_color = rgba_tuple
+
+    def add_annotation(self, ann_data):
+        """添加一个已完成的标注（带时间戳，自动过期消失）。"""
+        import time as _t
+        ann_data["_ts"] = _t.monotonic()
+        self._annotations.append(ann_data)
+
+    def clear_annotations(self):
+        self._annotations.clear()
 
     def stop_tap(self):
         pass
@@ -59,8 +89,8 @@ class GifRecorder(QObject):
         )
         # 轮询鼠标点击
         self._poll_click()
-        # 叠加点击效果
-        frame = self._draw_clicks(frame)
+        # 叠加标注 + 点击效果
+        frame = self._draw_overlays(frame)
         self.frame_captured.emit(frame)
 
     def _poll_click(self):
@@ -98,74 +128,111 @@ class GifRecorder(QObject):
         if new_pressed & 2:
             self._clicks.append((now, lx, ly, "right"))
 
-    def _draw_clicks(self, pixmap):
-        """把活跃点击效果叠加到帧上，返回新 QPixmap。
+    def _draw_overlays(self, pixmap):
+        """把活跃标注（闪烁）+ 点击涟漪叠加到帧上，返回新 QPixmap。
 
-        Material Design 风格涟漪：多层圆环 ease-out 扩散 + 中心光点。
-        用 PIL 在 2x 超采样图上画（实现抗锯齿），再缩回原始尺寸。
+        标注用 PIL 绘制（和点击涟漪一样），闪烁效果：前 _ANN_TTL 秒内交替
+        显示/半透明，到期自动移除。
         """
-        now = time.monotonic()
-        active = [(ts, lx, ly, btn) for (ts, lx, ly, btn) in self._clicks
-                  if now - ts < _CLICK_TTL]
-        if not active:
+        import time as _t
+        now = _t.monotonic()
+        # 清理过期标注
+        self._annotations = [a for a in self._annotations if now - a["_ts"] < _ANN_TTL]
+
+        # 收集活跃点击
+        active_clicks = [(ts, lx, ly, btn) for (ts, lx, ly, btn) in self._clicks
+                         if now - ts < _CLICK_TTL]
+        # 活跃标注（带闪烁 alpha）
+        active_anns = []
+        for a in self._annotations:
+            age = now - a["_ts"]
+            progress = age / _ANN_TTL
+            # 闪烁：交替全显示/半透明
+            blink_phase = (age / _ANN_TTL) * _ANN_BLINK_COUNT
+            alpha = 255 if int(blink_phase) % 2 == 0 else 0
+            if alpha == 0:
+                continue
+            active_anns.append((a, alpha))
+
+        if not active_clicks and not active_anns and not getattr(self, "_preview_ann", None):
             return pixmap
 
         from PIL import Image, ImageDraw
-        # QPixmap → PIL Image (RGBA)
         qimg = pixmap.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
         bits = qimg.bits()
         bits.setsize(qimg.sizeInBytes())
         pil = Image.frombytes("RGBA", (qimg.width(), qimg.height()), bytes(bits))
         W, H = pil.size
-
-        # 2x 超采样画布（实现抗锯齿），画完缩回
         SS = 2
         big = pil.resize((W * SS, H * SS), Image.LANCZOS)
         draw = ImageDraw.Draw(big)
 
-        for ts, lx, ly, btn in active:
+        # 画标注
+        for ann, alpha in active_anns:
+            self._draw_ann_pil(draw, ann, alpha, SS)
+        # 画预览
+        preview = getattr(self, "_preview_ann", None)
+        if preview:
+            self._draw_ann_pil(draw, preview, 255, SS)
+
+        # 画点击涟漪
+        for ts, lx, ly, btn in active_clicks:
             age = now - ts
-            t = age / _CLICK_TTL  # 线性进度 0→1
+            t = age / _CLICK_TTL
             if t > 0.85:
                 continue
-            # ease-out cubic（开始快扩散，后面减速）
             eased = 1 - (1 - t) ** 3
             r_main = int((6 + eased * (_CLICK_MAX_R - 6)) * SS)
             r_outer = int((10 + eased * (_CLICK_MAX_R + 8)) * SS)
-            r_inner = int(max(0, (14 * (1 - t))) * SS)  # 中心光点：大→缩→消失
             cx, cy = int(lx * SS), int(ly * SS)
-
-            # 配色：左键=亮蓝，右键=暖橙
-            if btn == "left":
-                main_rgb = (59, 130, 246)    # 蓝
-            else:
-                main_rgb = (251, 146, 60)    # 橙
-
-            # 第一层：外光晕环（白色，细，快扩散）
+            color = (59, 130, 246) if btn == "left" else (251, 146, 60)
             if r_outer > r_main:
-                bbox_o = [cx - r_outer, cy - r_outer, cx + r_outer, cy + r_outer]
-                draw.ellipse(bbox_o, outline=(255, 255, 255), width=max(1, int(1.5 * SS)))
-
-            # 第二层：主彩色环（粗，ease-out 扩散）
-            bbox_m = [cx - r_main, cy - r_main, cx + r_main, cy + r_main]
-            draw.ellipse(bbox_m, outline=main_rgb, width=max(2, int(4 * SS)))
-
-            # 第三层：中心光点（大→缩→消失，前 60% 生命周期）
+                draw.ellipse([cx - r_outer, cy - r_outer, cx + r_outer, cy + r_outer],
+                             outline=(255, 255, 255), width=max(1, int(1.5 * SS)))
+            draw.ellipse([cx - r_main, cy - r_main, cx + r_main, cy + r_main],
+                         outline=color, width=max(2, int(4 * SS)))
+            r_inner = int(max(0, (14 * (1 - t))) * SS)
             if r_inner > 0 and t < 0.6:
-                bbox_i = [cx - r_inner, cy - r_inner, cx + r_inner, cy + r_inner]
-                draw.ellipse(bbox_i, fill=main_rgb)
-                # 中心白色高光
+                draw.ellipse([cx - r_inner, cy - r_inner, cx + r_inner, cy + r_inner], fill=color)
                 hl_r = max(1, r_inner // 3)
-                bbox_h = [cx - hl_r, cy - hl_r, cx + hl_r, cy + hl_r]
-                draw.ellipse(bbox_h, fill=(255, 255, 255))
+                draw.ellipse([cx - hl_r, cy - hl_r, cx + hl_r, cy + hl_r], fill=(255, 255, 255))
 
-        # 缩回原始尺寸（LANCZOS 缩放 = 抗锯齿效果）
         pil = big.resize((W, H), Image.LANCZOS)
-
-        # PIL → QPixmap
         data = pil.tobytes("raw", "RGBA")
         out = QImage(data, W, H, QImage.Format.Format_RGBA8888).copy()
         return QPixmap.fromImage(out)
+
+    def _draw_ann_pil(self, draw, ann, alpha, SS):
+        """用 PIL 绘制单个标注（矩形/箭头），alpha 控制闪烁透明度。"""
+        color = ann.get("color", (255, 59, 48, 255))
+        r, g, b = color[0], color[1], color[2]
+        draw_color = (r, g, b, alpha) if len(color) >= 4 else (r, g, b)
+        w = max(2, int(ann.get("width", 3) * SS))
+        tool = ann.get("tool", "")
+
+        if tool == "rect":
+            rect = ann.get("rect")
+            if rect:
+                x0, y0 = int(rect[0] * SS), int(rect[1] * SS)
+                x1, y1 = int(rect[2] * SS), int(rect[3] * SS)
+                # 先画粗 outline，再画内层 outline（确保缩回后仍可见）
+                draw.rectangle([x0-2, y0-2, x1+2, y1+2], outline=(255,255,255,alpha), width=max(4, w+2))
+                draw.rectangle([x0, y0, x1, y1], outline=draw_color, width=max(4, w))
+        elif tool == "arrow":
+            sp = ann.get("start_pos")
+            ep = ann.get("end_pos")
+            if sp and ep:
+                sx, sy = int(sp[0] * SS), int(sp[1] * SS)
+                ex, ey = int(ep[0] * SS), int(ep[1] * SS)
+                draw.line([sx, sy, ex, ey], fill=draw_color, width=w)
+                # 箭头头部（简化：画一个小三角）
+                import math
+                angle = math.atan2(ey - sy, ex - sx)
+                head_len = max(8, w * 3)
+                for da in [-0.5, 0.5]:
+                    hx = ex - head_len * math.cos(angle + da)
+                    hy = ey - head_len * math.sin(angle + da)
+                    draw.line([ex, ey, int(hx), int(hy)], fill=draw_color, width=w)
 
 
 def frames_to_gif(frames, path, fps=12):
