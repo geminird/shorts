@@ -131,68 +131,35 @@ def _rgba_bytes_to_gray_np(data, W, H, ds=4):
 
 
 def _find_scroll_overlap_np(prev_bytes, new_bytes, W, Hp, Hn):
-    """基于归一化互相关(NCC)求相邻两帧的重叠行数。
+    """全帧逐行精确 SAD（限制搜索范围 50%-98%）。
 
-    用较小的降采样(ds=2)保留文字纹理；band_h 取帧高 1/3 增大区分度。NCC 阈值
-    0.5（真实滚动帧的 NCC 通常 >0.7，但平滑滚动有亚像素扰动，留余量）。
-    NCC 粗匹配后用像素精确匹配在 ±5 行范围微调（消除降采样误差）。
+    在所有可能的重叠值中找每像素平均差最小的。帧不大（~360行）时性能可接受。
     """
     import numpy as np
-    ds = 2
-    prev = _rgba_bytes_to_gray_np(prev_bytes, W, Hp, ds)
-    new = _rgba_bytes_to_gray_np(new_bytes, W, Hn, ds)
-    h_p, w = prev.shape
-    h_n, _ = new.shape
+    pa = np.frombuffer(prev_bytes, dtype=np.uint8).reshape(Hp, W, 4)
+    na = np.frombuffer(new_bytes, dtype=np.uint8).reshape(Hn, W, 4)
+    pa_rgb = pa[:, :, :3].astype(np.int32)
+    na_rgb = na[:, :, :3].astype(np.int32)
 
-    band_h = max(16, min(h_n // 4, 80))
-    if band_h >= h_n or band_h >= h_p or w < 4:
+    ov_min = max(6, int(min(Hp, Hn) * 0.5))
+    ov_max = int(min(Hp, Hn) * 0.98)
+    if ov_max <= ov_min:
         return 0
-    template = prev[h_p - band_h:h_p].astype(np.float64)
-    t_std = template.std()
-    if t_std < 1e-6:
+
+    best_ratio = float('inf')
+    best_ov = 0
+    for ov in range(ov_min, ov_max + 1):
+        pt = pa_rgb[Hp - ov:]
+        nt = na_rgb[:ov]
+        if pt.shape == nt.shape:
+            r = np.abs(pt - nt).mean()
+            if r < best_ratio:
+                best_ratio = r
+                best_ov = ov
+
+    if best_ratio > 30:
         return 0
-    t_norm = (template - template.mean()) / t_std
-
-    best_ncc = -1.0
-    best_pos = -1
-    for y in range(0, h_n - band_h + 1):
-        window = new[y:y + band_h].astype(np.float64)
-        w_std = window.std()
-        if w_std < 1e-6:
-            continue
-        w_norm = (window - window.mean()) / w_std
-        ncc = float((w_norm * t_norm).mean())
-        if ncc > best_ncc:
-            best_ncc = ncc
-            best_pos = y
-
-    if best_ncc < 0.5 or best_pos < 0:
-        return 0
-    scroll_px = ((h_p - band_h) - best_pos) * ds
-    if scroll_px <= 0:
-        return max(0, Hp - 1)
-    overlap = Hp - scroll_px
-    overlap = max(0, min(overlap, Hp))
-
-    # 像素精确微调：在 overlap±5 行范围用全帧 SAD 找精确值
-    if overlap > 10 and overlap < Hp - 5:
-        row_size_phys = W * 4
-        pa = np.frombuffer(prev_bytes, dtype=np.uint8).astype(np.int32).reshape(Hp, W, 4)
-        na = np.frombuffer(new_bytes, dtype=np.uint8).astype(np.int32).reshape(Hn, W, 4)
-        best_ov = overlap
-        best_diff = float('inf')
-        for try_ov in range(max(1, overlap - 5), min(Hp, overlap + 6)):
-            # prev 底部 try_ov 行 vs new 顶部 try_ov 行
-            pt = pa[Hp - try_ov:]
-            nt = na[:try_ov]
-            if pt.shape == nt.shape:
-                diff = np.abs(pt - nt).sum()
-                if diff < best_diff:
-                    best_diff = diff
-                    best_ov = try_ov
-        overlap = best_ov
-
-    return overlap
+    return best_ov
 
 
 
@@ -257,8 +224,8 @@ def _stitch_images(images):
             prev_bytes, new_bytes, W, col_stride
         )
         keep = new_h - ov
-        if keep < 5:
-            continue
+        if ov == 0 or keep < 10:
+            continue  # 无可靠重叠或新内容太少 → 跳过（避免重复/黑线）
         # 拼接处渐变混合（消除亚像素偏移导致的黑线/错位）：
         # 在 ov 行前 4 行做线性过渡，从 prev 内容渐变到 new 内容
         blend_rows = min(4, ov // 2)
@@ -282,12 +249,12 @@ def _stitch_images(images):
                     mixed = (prev_tail[s:e] * a + new_blend[s:e] * (1 - a)).astype(np.uint8)
                     result_bytes[prev_tail_start + s : prev_tail_start + e] = mixed.tobytes()
         # 追加 new 中重叠行之后的新内容（跳过第 0 行——可能是截图边缘伪影）
-        result_bytes.extend(new_bytes[(ov + 1) * row_size:])
-        result_h += (new_h - ov - 1)
+        result_bytes.extend(new_bytes[ov * row_size:])
+        result_h += (new_h - ov)
 
     return QImage(
         bytes(result_bytes), W, result_h, row_size, QImage.Format.Format_RGBA8888
-    ).copy()  # .copy() 确保数据独立
+    ).copy()
 
 
 from core.hotkey import HotkeyManager
@@ -315,17 +282,6 @@ class ShortsApp:
         if self.tray_icon is not None and not self.tray_icon.icon().isNull():
             self.app.setWindowIcon(self.tray_icon.icon())
         self._register_hotkey()
-        # 预热 mss：首次截图时 mss 初始化（CGWindowList/框架加载）很慢，
-        # 启动时在后台线程先初始化一次，首次截图就快了。
-        import threading
-        def _warmup():
-            try:
-                import mss
-                with mss.mss() as sct:
-                    sct.grab({"left": 0, "top": 0, "width": 1, "height": 1})
-            except Exception:
-                pass
-        threading.Thread(target=_warmup, daemon=True).start()
 
     def _setup_tray(self):
         """设置系统托盘"""
@@ -505,7 +461,8 @@ class _ScrollCaptureWorker(QObject):
                     break
                 frame = shot.capture_region(
                     self._rect.x(), self._rect.y(),
-                    self._rect.width(), self._rect.height()
+                    self._rect.width(), self._rect.height(),
+                    use_2x=False  # 滚动截图用 1x（避免 2x 亚像素差异导致拼接失败）
                 )
                 img = frame.toImage().convertToFormat(QImage.Format.Format_RGBA8888).copy()
                 bits = img.bits()
@@ -3320,7 +3277,6 @@ class SelectionWindow(QWidget):
             return result
 
         if self.background_pixmap and self.selection_rect.isValid():
-            # 背景图设了 DPR（物理像素 2x），copy 需按物理坐标裁剪
             dpr = self.background_pixmap.devicePixelRatio() or 1.0
             phys_rect = QRect(
                 round(self.selection_rect.x() * dpr),
@@ -3332,8 +3288,6 @@ class SelectionWindow(QWidget):
             result.setDevicePixelRatio(dpr)
             painter = QPainter(result)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            # QPixmap 设了 DPR：QPainter 自动在逻辑坐标系下绘制，pen/字号正常。
-            # 不需要 painter.scale。
 
             offset_x = self.selection_rect.x()
             offset_y = self.selection_rect.y()
@@ -3838,7 +3792,7 @@ class SelectionWindow(QWidget):
         last_saved = self.scroll_last_bytes
         if last_saved is not None and len(last_saved) == len(data):
             diff = _bytes_diff_ratio(last_saved, data)
-            if diff < 0.008:
+            if diff < 0.08:  # 变化 <8% 视为未显著滚动，跳过（慢速滚动时帧间差异极小，需高阈值过滤）
                 # 内容未显著变化 → 累计静止次数
                 self.scroll_no_change_count += 1
                 if self.scroll_no_change_count >= 40:  # ~静止 1.6s → 自动结束
