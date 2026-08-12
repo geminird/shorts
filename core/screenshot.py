@@ -13,7 +13,9 @@ from utils.platform import is_macos, device_pixel_ratio
 if is_macos():
     try:
         from mss import darwin as _mss_darwin
-        _mss_darwin.IMAGE_OPTIONS = 0
+        # IMAGE_OPTIONS=3: kCGWindowImageBoundsIgnoreFraming(1) | kCGWindowImageShouldBeOpaque(2)
+        # 去掉 kCGWindowImageNominalResolution(16)，获取 Retina 2x 物理像素（清晰）
+        _mss_darwin.IMAGE_OPTIONS = 3
     except Exception:
         pass
 

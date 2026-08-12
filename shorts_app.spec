@@ -20,7 +20,7 @@ if sys.platform == 'darwin':
 else:
     icon = _icon_win
 
-hiddenimports = ['PyQt6', 'mss', 'PIL', 'pynput', 'numpy']
+hiddenimports = ['PyQt6', 'mss', 'PIL', 'pynput', 'numpy', 'cv2']
 if sys.platform == 'darwin':
     # macOS：窗口枚举用到 Quartz；pynput 的 darwin 后端；ApplicationServices 辅助功能检测
     hiddenimports += [

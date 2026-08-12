@@ -20,7 +20,7 @@ from PyQt6.QtGui import (
 sys.path.insert(0, str(Path(__file__).parent))
 
 from core.screenshot import Screenshot
-from utils.platform import is_macos, overlay_window_flags, raise_overlay, activate_foreground_app, make_mouse_passthrough, make_floating_panel
+from utils.platform import is_macos, overlay_window_flags, raise_overlay, activate_foreground_app, make_mouse_passthrough, make_floating_panel, device_pixel_ratio
 from PIL import Image
 
 
@@ -131,35 +131,82 @@ def _rgba_bytes_to_gray_np(data, W, H, ds=4):
 
 
 def _find_scroll_overlap_np(prev_bytes, new_bytes, W, Hp, Hn):
-    """全帧逐行精确 SAD（限制搜索范围 50%-98%）。
+    """用 cv2.matchTemplate (TM_CCOEFF_NORMED) + Sobel 边缘 + Lowe ratio test 检测重叠。
 
-    在所有可能的重叠值中找每像素平均差最小的。帧不大（~360行）时性能可接受。
+    参考成熟工具（mate-matt/screenshot-stitcher、xutianyi1999/scrollshot）的做法：
+    - Sobel 边缘特征图代替原始像素（文字页面上更精确，一行错位也能检测到）
+    - NCC 归一化互相关（亮度/对比度不变，抗亚像素渲染差异）
+    - Lowe ratio test（最佳峰值必须明显超过次佳，否则拒绝——抗重复模式）
     """
     import numpy as np
+    import cv2
+
     pa = np.frombuffer(prev_bytes, dtype=np.uint8).reshape(Hp, W, 4)
     na = np.frombuffer(new_bytes, dtype=np.uint8).reshape(Hn, W, 4)
+
+    # 灰度
+    prev_gray = cv2.cvtColor(pa, cv2.COLOR_RGBA2GRAY)
+    new_gray = cv2.cvtColor(na, cv2.COLOR_RGBA2GRAY)
+
+    # Sobel 边缘特征（文字行检测更精确）
+    prev_edge = cv2.Sobel(prev_gray, cv2.CV_32F, 0, 1, ksize=3)
+    new_edge = cv2.Sobel(new_gray, cv2.CV_32F, 0, 1, ksize=3)
+    # 归一化到 0-255
+    prev_edge = np.clip(prev_edge, 0, 255).astype(np.uint8)
+    new_edge = np.clip(new_edge, 0, 255).astype(np.uint8)
+
+    # 模板：prev 底部自适应高度
+    win = max(20, min(Hp // 4, 80))
+    tmpl = prev_edge[Hp - win:]  # (win, W)
+
+    # matchTemplate 在 new_edge 中搜索模板
+    res = cv2.matchTemplate(new_edge, tmpl, cv2.TM_CCOEFF_NORMED)
+    # res shape: (Hn - win + 1, W - W + 1) = (Hn - win + 1, 1) → 只关心 y 方向
+    res_flat = res.flatten()  # 每个位置 y 的 NCC 分数
+
+    if len(res_flat) == 0:
+        return 0
+
+    # 找最佳和次佳
+    sorted_idx = np.argsort(res_flat)[::-1]  # 降序
+    best_y = sorted_idx[0]
+    best_val = res_flat[best_y]
+    second_val = res_flat[sorted_idx[1]] if len(sorted_idx) > 1 else 0
+
+    # Lowe ratio test：最佳必须明显超过次佳（差值 > 0.05）
+    if best_val - second_val < 0.05:
+        return 0  # 歧义匹配，拒绝
+
+    # NCC 分数太低
+    if best_val < 0.5:
+        return 0
+
+    # best_y = 模板在 new 中的起始行
+    # → 滚动量 = (Hp - win) - best_y
+    scroll_px = (Hp - win) - best_y
+    if scroll_px <= 0:
+        return max(0, Hp - 1)
+
+    # 像素精确微调：在 NCC 最佳位置 ±2 行用全像素 SAD 找最精确值
     pa_rgb = pa[:, :, :3].astype(np.int32)
     na_rgb = na[:, :, :3].astype(np.int32)
+    tmpl_rgb = pa_rgb[Hp - win:]
+    best_diff = float('inf')
+    best_y_fine = best_y
+    for delta in range(-2, 3):
+        pos = best_y + delta
+        if pos < 0 or pos + win > Hn:
+            continue
+        d = np.abs(na_rgb[pos:pos + win] - tmpl_rgb).mean()
+        if d < best_diff:
+            best_diff = d
+            best_y_fine = pos
 
-    ov_min = max(6, int(min(Hp, Hn) * 0.5))
-    ov_max = int(min(Hp, Hn) * 0.98)
-    if ov_max <= ov_min:
-        return 0
-
-    best_ratio = float('inf')
-    best_ov = 0
-    for ov in range(ov_min, ov_max + 1):
-        pt = pa_rgb[Hp - ov:]
-        nt = na_rgb[:ov]
-        if pt.shape == nt.shape:
-            r = np.abs(pt - nt).mean()
-            if r < best_ratio:
-                best_ratio = r
-                best_ov = ov
-
-    if best_ratio > 30:
-        return 0
-    return best_ov
+    scroll_px = (Hp - win) - best_y_fine
+    if scroll_px <= 0:
+        return max(0, Hp - 1)
+    overlap = Hp - scroll_px
+    return max(0, min(overlap, Hp))
 
 
 
@@ -462,7 +509,7 @@ class _ScrollCaptureWorker(QObject):
                 frame = shot.capture_region(
                     self._rect.x(), self._rect.y(),
                     self._rect.width(), self._rect.height(),
-                    use_2x=False  # 滚动截图用 1x（避免 2x 亚像素差异导致拼接失败）
+                    use_2x=True  # 2x 物理像素（清晰 + 正确的 IMAGE_OPTIONS=3）
                 )
                 img = frame.toImage().convertToFormat(QImage.Format.Format_RGBA8888).copy()
                 bits = img.bits()
@@ -475,7 +522,7 @@ class _ScrollCaptureWorker(QObject):
             except Exception:
                 pass
             # ~40ms 一帧。子线程里 sleep 不影响主线程事件循环。
-            _thread_sleep(0.04)
+            _thread_sleep(0.04)  # 40ms 抓帧
 
     def stop(self):
         self._running = False
@@ -4322,6 +4369,9 @@ class SelectionWindow(QWidget):
         stitched = None
         if image is not None and not image.isNull():
             stitched = QPixmap.fromImage(image)
+            dpr = device_pixel_ratio()
+            if dpr != 1.0:
+                stitched.setDevicePixelRatio(dpr)
 
         if stitched and not stitched.isNull():
             # 保存全分辨率原图
