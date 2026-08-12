@@ -206,7 +206,16 @@ def _find_scroll_overlap_np(prev_bytes, new_bytes, W, Hp, Hn):
     if scroll_px <= 0:
         return max(0, Hp - 1)
     overlap = Hp - scroll_px
-    return max(0, min(overlap, Hp))
+    overlap = max(0, min(overlap, Hp))
+    # [诊断]
+    try:
+        import pathlib
+        p = pathlib.Path("/tmp/stitch_ov.log")
+        prev_t = p.read_text(encoding="utf-8") if p.exists() else ""
+        p.write_text(prev_t + f"ov={overlap} keep={Hp-overlap} ncc={best_val:.3f} ratio_gap={best_val-second_val:.3f}\n", encoding="utf-8")
+    except Exception:
+        pass
+    return overlap
 
 
 
@@ -272,7 +281,7 @@ def _stitch_images(images):
         )
         keep = new_h - ov
         if ov == 0 or keep < 10:
-            continue  # 无可靠重叠或新内容太少 → 跳过（避免重复/黑线）
+            continue
         # 拼接处渐变混合（消除亚像素偏移导致的黑线/错位）：
         # 在 ov 行前 4 行做线性过渡，从 prev 内容渐变到 new 内容
         blend_rows = min(4, ov // 2)
@@ -486,11 +495,13 @@ class _ScrollDimOverlay(QWidget):
 
 
 class _ScrollCaptureWorker(QObject):
-    """在子线程中高频抓帧，避免阻塞主线程导致滚动事件丢失。
+    """滚轮事件驱动的抓帧（macshot 方案）。
 
-    主线程若直接 mss.grab（30ms 一次）会让 UI 卡顿、目标窗口收不到滚轮。
-    放到 QThread 里跑：定时抓取选区区域，把 RGBA 字节 + 尺寸通过信号发给
-    主线程；主线程只做轻量的去重/保存与拼接决策。
+    用 NSEvent global monitor 监听滚轮事件：
+    - 滚轮事件触发 → 150ms 节流抓帧（避免一次滚动抓太多帧）
+    - 滚动停止 300ms 后 → 抓最后一帧（确保画面稳定）
+    - 不滚动时不抓帧（天然内容驱动，帧间重叠由用户滚动节奏决定）
+    需要「输入监控」权限。
     """
     frame_captured = pyqtSignal(bytes, int, int, int, int)  # data, x, y, w, h
 
@@ -498,6 +509,10 @@ class _ScrollCaptureWorker(QObject):
         super().__init__()
         self._rect = QRect(rect)
         self._running = True
+        self._scroll_monitor = None
+        self._scroll_active = False  # 当前是否在滚动
+        self._scroll_start_time = 0  # 滚动开始时间（第一次事件）
+        self._last_capture_time = 0  # 最后一次抓帧的时间戳
 
     def run(self):
         from core.screenshot import Screenshot
@@ -509,7 +524,7 @@ class _ScrollCaptureWorker(QObject):
                 frame = shot.capture_region(
                     self._rect.x(), self._rect.y(),
                     self._rect.width(), self._rect.height(),
-                    use_2x=True  # 2x 物理像素（清晰 + 正确的 IMAGE_OPTIONS=3）
+                    use_2x=True
                 )
                 img = frame.toImage().convertToFormat(QImage.Format.Format_RGBA8888).copy()
                 bits = img.bits()
@@ -521,11 +536,51 @@ class _ScrollCaptureWorker(QObject):
                 )
             except Exception:
                 pass
-            # ~40ms 一帧。子线程里 sleep 不影响主线程事件循环。
-            _thread_sleep(0.04)  # 40ms 抓帧
+            _thread_sleep(0.03)  # 30ms 固定间隔（去重逻辑过滤静止帧）
+
+    def _install_scroll_monitor(self):
+        """装 NSEvent global scrollWheel monitor。"""
+        import sys as _sys
+        if _sys.platform != "darwin":
+            return
+        try:
+            from AppKit import NSEvent, NSEventMaskScrollWheel
+        except Exception:
+            return
+        import time as _time
+        try:
+            def on_scroll(event):
+                now = _time.monotonic()
+                if not self._scroll_active:
+                    self._scroll_active = True
+                    self._scroll_start_time = now
+                self._scroll_last_event = now
+                # [诊断] 确认滚轮事件被接收
+                try:
+                    import pathlib
+                    p = pathlib.Path("/tmp/scroll_events.log")
+                    prev = p.read_text(encoding="utf-8") if p.exists() else ""
+                    p.write_text(prev + f"scroll @ {now:.2f}\n", encoding="utf-8")
+                except Exception:
+                    pass
+
+            self._scroll_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                NSEventMaskScrollWheel, on_scroll
+            )
+            print(f"滚轮监听器已安装: {self._scroll_monitor is not None}")
+        except Exception as e:
+            print(f"滚轮监听器安装失败: {e}")
 
     def stop(self):
         self._running = False
+        # 卸载滚轮监听器
+        if self._scroll_monitor is not None:
+            try:
+                from AppKit import NSEvent
+                NSEvent.removeMonitor_(self._scroll_monitor)
+            except Exception:
+                pass
+            self._scroll_monitor = None
 
 
 def _thread_sleep(seconds):
@@ -3839,7 +3894,7 @@ class SelectionWindow(QWidget):
         last_saved = self.scroll_last_bytes
         if last_saved is not None and len(last_saved) == len(data):
             diff = _bytes_diff_ratio(last_saved, data)
-            if diff < 0.08:  # 变化 <8% 视为未显著滚动，跳过（慢速滚动时帧间差异极小，需高阈值过滤）
+            if diff < 0.015:  # 变化 <2% 视为未显著滚动，跳过
                 # 内容未显著变化 → 累计静止次数
                 self.scroll_no_change_count += 1
                 if self.scroll_no_change_count >= 40:  # ~静止 1.6s → 自动结束
