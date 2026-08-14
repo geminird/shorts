@@ -1867,7 +1867,14 @@ class SelectionWindow(QWidget):
             self.update()
 
     def eventFilter(self, obj, event):
-        """事件过滤器 - 处理文字输入框的回车键（Esc 由 QShortcut 处理）。"""
+        """事件过滤器 - 处理文字输入框回车 + 滚动模式空格键。"""
+        # 滚动模式：空格键切换自动滚动
+        if (event.type() == event.Type.KeyPress
+                and event.key() == Qt.Key.Key_Down
+                and getattr(self, '_scroll_mode', False)):
+            self._toggle_auto_scroll()
+            return True
+        # 文字输入框回车
         if obj == getattr(self, 'text_input', None):
             if event.type() == event.Type.KeyPress:
                 if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -3801,8 +3808,11 @@ class SelectionWindow(QWidget):
                 raise_overlay(self.scroll_capture_bar)
         QTimer.singleShot(250, _raise_overlays)
 
-        # 延迟启动 Timer(给窗口管理器时间处理隐藏)
+        # 恢复子线程抓帧（手动滚动模式）
         QTimer.singleShot(400, self._start_scroll_timer)
+        # 自动滚动状态
+        self._auto_scrolling = False
+        self._auto_scroll_timer = None
 
     def _show_scroll_capture_outline(self):
         """显示捕获区域的高亮遮罩(选区外遮罩 + 蓝边)，复刻正常选区高亮模式。
@@ -3859,13 +3869,21 @@ class SelectionWindow(QWidget):
 
         layout = QHBoxLayout(self.scroll_capture_bar)
         layout.setContentsMargins(12, 4, 12, 4)
-        self.scroll_status_label = QLabel("滚动截图中 | 已捕获 0 帧（自由滚动，自动抓帧）")
+        self.scroll_status_label = QLabel("按↓键自动滚动 | 已捕获 0 帧")
         done_btn = QPushButton("完成")
         done_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         done_btn.clicked.connect(self._finish_scroll_capture)
         layout.addWidget(self.scroll_status_label)
         layout.addStretch()
         layout.addWidget(done_btn)
+
+        # 自动滚动状态
+        self._auto_scrolling = False
+        self._auto_scroll_timer = None
+
+        # 空格键切换自动滚动（给浮窗加 eventFilter）
+        self.scroll_capture_bar.installEventFilter(self)
+        self._scroll_mode = True  # 标记滚动模式，eventFilter 检查
 
         # 定位到"捕获区域所在屏幕"的顶部居中(多显示器下跟随用户当前屏幕)
         scr = QGuiApplication.screenAt(self.scroll_capture_rect.center()) or QApplication.primaryScreen()
@@ -3888,6 +3906,105 @@ class SelectionWindow(QWidget):
         self._scroll_thread.started.connect(self._scroll_worker.run)
         self._scroll_worker.frame_captured.connect(self._on_scroll_frame_captured)
         self._scroll_thread.start()
+
+    def _toggle_auto_scroll(self):
+        """空格键切换自动滚动。"""
+        import pathlib
+        try:
+            p = pathlib.Path("/tmp/space_key.log")
+            prev = p.read_text(encoding="utf-8") if p.exists() else ""
+            p.write_text(prev + f"SPACE toggled: is_scroll_capturing={self.is_scroll_capturing} auto={self._auto_scrolling}\n", encoding="utf-8")
+        except Exception:
+            pass
+        if not getattr(self, 'is_scroll_capturing', False):
+            return
+        if self._auto_scrolling:
+            # 停止自动滚动
+            self._auto_scrolling = False
+            if self._auto_scroll_timer:
+                self._auto_scroll_timer.stop()
+                self._auto_scroll_timer = None
+            self.scroll_status_label.setText(
+                f"已暂停 | 已捕获 {len(self.scroll_frames)} 帧 | ↓键继续，点完成结束")
+        else:
+            # 开始自动滚动
+            self._auto_scrolling = True
+            self.scroll_status_label.setText(
+                f"自动滚动中 | 已捕获 {len(self.scroll_frames)} 帧 | ↓键暂停")
+            # 抓第一帧（当前画面）
+            self._auto_scroll_capture_frame()
+            # 每 400ms 滚动 + 抓帧
+            self._auto_scroll_timer = QTimer(self)
+            self._auto_scroll_timer.timeout.connect(self._auto_scroll_step)
+            self._auto_scroll_timer.start(400)
+
+    def _auto_scroll_step(self):
+        """自动滚动一步：发送滚轮事件 → 等画面稳定 → 抓帧。"""
+        if not self._auto_scrolling:
+            return
+        try:
+            import pathlib
+            p = pathlib.Path("/tmp/space_key.log")
+            prev = p.read_text(encoding="utf-8") if p.exists() else ""
+            p.write_text(prev + f"STEP: sending scroll event\n", encoding="utf-8")
+        except Exception:
+            pass
+        # 发送滚轮事件（向下滚 3 个 notch）
+        if is_macos():
+            try:
+                from Quartz import (CGEventCreateScrollWheelEvent,
+                                    kCGScrollEventUnitPixel,
+                                    CGEventPost, kCGHIDEventTap)
+                # 创建滚轮事件（3 个 notch 向下）
+                event = CGEventCreateScrollWheelEvent(None, kCGScrollEventUnitPixel, 1, 3)
+                CGEventPost(kCGHIDEventTap, event)
+            except Exception:
+                pass
+        else:
+            import pyautogui
+            pyautogui.scroll(-3)
+
+        # 等 200ms 画面稳定后抓帧
+        QTimer.singleShot(200, self._auto_scroll_capture_frame)
+
+    def _auto_scroll_capture_frame(self):
+        """抓一帧（自动滚动模式）。"""
+        try:
+            shot = Screenshot()
+            frame = shot.capture_region(
+                self.scroll_capture_rect.x(), self.scroll_capture_rect.y(),
+                self.scroll_capture_rect.width(), self.scroll_capture_rect.height(),
+                use_2x=True
+            )
+            img = frame.toImage().convertToFormat(QImage.Format.Format_RGBA8888).copy()
+            bits = img.bits()
+            bits.setsize(img.sizeInBytes())
+            data = bytes(bits)
+
+            # 去重检查
+            if self.scroll_last_bytes and len(self.scroll_last_bytes) == len(data):
+                diff = _bytes_diff_ratio(self.scroll_last_bytes, data)
+                if diff < 0.005:
+                    # 内容没变（可能到底了）
+                    self.scroll_no_change_count += 1
+                    if self.scroll_no_change_count >= 5:
+                        # 连续 5 次没变化 → 自动停止
+                        self._auto_scrolling = False
+                        if self._auto_scroll_timer:
+                            self._auto_scroll_timer.stop()
+                        self.scroll_status_label.setText(
+                            f"已到底部 | 已捕获 {len(self.scroll_frames)} 帧 | 点完成结束")
+                    return
+                self.scroll_no_change_count = 0
+
+            self.scroll_frames.append(QPixmap.fromImage(img))
+            self.scroll_last_bytes = data
+            self.scroll_no_change_count = 0
+            if self.scroll_status_label:
+                self.scroll_status_label.setText(
+                    f"自动滚动中 | 已捕获 {len(self.scroll_frames)} 帧 | ↓键暂停")
+        except Exception:
+            pass
 
     def _on_scroll_frame_captured(self, data, x, y, w, h):
         """主线程：接收子线程抓到的帧，做去重/保存。"""
@@ -4335,6 +4452,11 @@ class SelectionWindow(QWidget):
         self.finished.emit()
 
     def _finish_scroll_capture(self):
+        self._scroll_mode = False
+        self._auto_scrolling = False
+        if getattr(self, "_auto_scroll_timer", None):
+            self._auto_scroll_timer.stop()
+            self._auto_scroll_timer = None
         """结束滚动截图：在主线程同步拼接。
 
         历史上这里用 QThread + _StitchWorker 把 _stitch_images 放到工作线程，
