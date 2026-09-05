@@ -27,13 +27,18 @@ jobs:
         run: pyinstaller shorts_app.spec --noconfirm
       - name: Adhoc codesign
         run: codesign --force --deep --sign - dist/Shorts.app
-      - name: Package zip
-        run: cd dist && ditto -c -k --keepParent Shorts.app Shorts-macOS-arm64.zip
+      - name: Package zip + dmg
+        run: |
+          cd dist
+          ditto -c -k --keepParent Shorts.app Shorts-macOS-arm64.zip
+          hdiutil create -volname Shorts -srcfolder Shorts.app -ov -format UDZO Shorts-macOS-arm64.dmg
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: Shorts-macOS-arm64
-          path: dist/Shorts-macOS-arm64.zip
+          path: |
+            dist/Shorts-macOS-arm64.zip
+            dist/Shorts-macOS-arm64.dmg
 
   build-windows:
     runs-on: windows-latest
@@ -48,14 +53,16 @@ jobs:
           pip install -r requirements.txt
       - name: Build
         run: pyinstaller shorts_app.spec --noconfirm
-      - name: Package zip
+      - name: Package
         shell: powershell
         run: Compress-Archive -Path dist/Shorts.exe -DestinationPath dist/Shorts-Windows-x64.zip
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: Shorts-Windows-x64
-          path: dist/Shorts-Windows-x64.zip
+          path: |
+            dist/Shorts.exe
+            dist/Shorts-Windows-x64.zip
 
   release:
     needs: [build-macos, build-windows]
@@ -71,4 +78,6 @@ jobs:
         with:
           files: |
             dist/Shorts-macOS-arm64/Shorts-macOS-arm64.zip
+            dist/Shorts-macOS-arm64/Shorts-macOS-arm64.dmg
+            dist/Shorts-Windows-x64/Shorts.exe
             dist/Shorts-Windows-x64/Shorts-Windows-x64.zip

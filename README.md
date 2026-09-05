@@ -8,8 +8,12 @@
 
 | 文件 | 平台 |
 |------|------|
-| `Shorts-macOS-arm64.zip` | macOS（Apple Silicon，非签名版，首次打开见下方权限说明） |
-| `Shorts-Windows-x64.zip` | Windows x64 |
+| `Shorts.exe` | Windows x64，单文件直接运行 |
+| `Shorts-Windows-x64.zip` | Windows x64（同上，压缩版） |
+| `Shorts-macOS-arm64.dmg` | macOS Apple Silicon，双击挂载后拖入「应用程序」 |
+| `Shorts-macOS-arm64.zip` | macOS Apple Silicon（解压即 .app，压缩版） |
+
+> macOS 包为 adhoc 签名：首次打开被 Gatekeeper 拦时，右键 App →「打开」，或在终端执行 `xattr -cr /Applications/Shorts.app`。Windows 未签名，SmartScreen 提示时选「仍要运行」。
 
 ## 功能
 
