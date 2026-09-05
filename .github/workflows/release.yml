@@ -29,15 +29,14 @@ jobs:
         run: codesign --force --deep --sign - dist/Shorts.app
       - name: Package zip + dmg
         run: |
-          # macOS runner 只有 ~14GB 可用磁盘，PyInstaller 全流程(依赖+build+dist+
-          # .app 90MB)会耗尽。打包前清理一切非必需缓存。
-          rm -rf build ~/.pyinstaller
-          pip cache purge || true
-          rm -rf ~/hostedtoolcache/Python/3.13.15/arm64/lib/python3.13/site-packages/pip/_vendor 2>/dev/null || true
-          df -h / | tail -1
+          # macOS runner 上 hdiutil 直接打 dist/ 内的 .app 偶发 ENOSPC 假错
+          # (磁盘其实充足，是 APFS 挂载/中间镜像问题)。把 .app 拷到干净临时
+          # 目录再制作，规避 hdiutil 对 PyInstaller 目录结构的挂载冲突。
+          rm -rf build
           cd dist
           ditto -c -k --keepParent Shorts.app Shorts-macOS-arm64.zip
-          hdiutil create -volname Shorts -srcfolder Shorts.app -ov -format UDZO Shorts-macOS-arm64.dmg
+          mkdir -p /tmp/dmgroot && ditto Shorts.app /tmp/dmgroot/Shorts.app
+          hdiutil create -volname Shorts -srcfolder /tmp/dmgroot -ov -format UDZO Shorts-macOS-arm64.dmg
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
