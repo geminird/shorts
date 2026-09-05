@@ -29,14 +29,20 @@ jobs:
         run: codesign --force --deep --sign - dist/Shorts.app
       - name: Package zip + dmg
         run: |
-          # macOS runner 上 hdiutil 直接打 dist/ 内的 .app 偶发 ENOSPC 假错
-          # (磁盘其实充足，是 APFS 挂载/中间镜像问题)。把 .app 拷到干净临时
-          # 目录再制作，规避 hdiutil 对 PyInstaller 目录结构的挂载冲突。
+          # GitHub macOS runner 上 hdiutil create -srcfolder 会报假 ENOSPC
+          # (df 明明有 37G)——runner 沙箱下自动中介镜像挂载失败。社区标准
+          # 解法：手动分步(显式大小挂空盘→cp→卸载→convert)。
           rm -rf build
           cd dist
           ditto -c -k --keepParent Shorts.app Shorts-macOS-arm64.zip
-          mkdir -p /tmp/dmgroot && ditto Shorts.app /tmp/dmgroot/Shorts.app
-          hdiutil create -volname Shorts -srcfolder /tmp/dmgroot -ov -format UDZO Shorts-macOS-arm64.dmg
+          rm -rf /tmp/dmgroot && mkdir -p /tmp/dmgroot
+          ditto Shorts.app /tmp/dmgroot/Shorts.app
+          SIZE=$(( $(du -sm /tmp/dmgroot | awk '{print $1}') * 2 + 100 ))
+          hdiutil create -size ${SIZE}m -volname Shorts -fs HFS+ -ov -attach /tmp/scratch.dmg
+          cp -R /tmp/dmgroot/Shorts.app /Volumes/Shorts/
+          hdiutil detach /Volumes/Shorts
+          hdiutil convert /tmp/scratch.dmg -format UDZO -o Shorts-macOS-arm64.dmg
+          rm -f /tmp/scratch.dmg
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
