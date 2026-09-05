@@ -29,6 +29,8 @@ jobs:
         run: codesign --force --deep --sign - dist/Shorts.app
       - name: Package zip + dmg
         run: |
+          rm -rf build
+          pip cache purge || true
           cd dist
           ditto -c -k --keepParent Shorts.app Shorts-macOS-arm64.zip
           hdiutil create -volname Shorts -srcfolder Shorts.app -ov -format UDZO Shorts-macOS-arm64.dmg
