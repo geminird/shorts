@@ -2,6 +2,15 @@
 
 跨平台截图标注工具（macOS / Windows），Python + PyQt6 单代码库。区域 / 窗口 / 全屏 / 滚动长截图、GIF 与 MP4 录制、OCR、十余种标注工具。
 
+## 下载
+
+到 [Releases](https://github.com/geminird/shorts/releases) 下载对应平台安装包：
+
+| 文件 | 平台 |
+|------|------|
+| `Shorts-macOS-arm64.zip` | macOS（Apple Silicon，非签名版，首次打开见下方权限说明） |
+| `Shorts-Windows-x64.zip` | Windows x64 |
+
 ## 功能
 
 - **区域截图** — 拖拽选区，自动吸附窗口边缘
