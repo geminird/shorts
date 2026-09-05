@@ -6,3 +6,6 @@ dist/
 *.log
 _o.txt
 __test_*.out
+.DS_Store
+.claude/
+output.log

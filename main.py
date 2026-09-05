@@ -72,20 +72,6 @@ def _virtual_desktop_geometry():
 
 
 # ---- 滚动帧缝合：纯函数，不访问 self、不碰 QPixmap，可在工作线程安全调用 ----
-def _row_color_sums(data, W, H, row_size, col_stride):
-    """每行采样列的 (R+G+B) 之和作为该行签名，返回 list[int]，长度 H。
-    采样列用于大幅降低计算量，同时保留足够的横向区分度。"""
-    sigs = []
-    for y in range(H):
-        base = y * row_size
-        s = 0
-        for x in range(0, W, col_stride):
-            o = base + x * 4
-            s += data[o] + data[o + 1] + data[o + 2]  # R+G+B(忽略 A)
-        sigs.append(s)
-    return sigs
-
-
 def _bytes_diff_ratio(a, b, threshold=24):
     """两帧 RGBA 字节的内容差异占比（采样）：差异像素数 / 采样像素数。
 
@@ -130,116 +116,125 @@ def _rgba_bytes_to_gray_np(data, W, H, ds=4):
     return out
 
 
-def _find_scroll_overlap_np(prev_bytes, new_bytes, W, Hp, Hn):
-    """用 cv2.matchTemplate (TM_CCOEFF_NORMED) + Sobel 边缘 + Lowe ratio test 检测重叠。
+def _find_scroll_overlap_np(prev_bytes, new_bytes, W, Hp, Hn, wheel_prior=0):
+    """v6 重叠检测：NCC 候选峰 + 顶部带像素 SAD 仲裁（合成基准 0 错配验证过）。
 
-    参考成熟工具（mate-matt/screenshot-stitcher、xutianyi1999/scrollshot）的做法：
-    - Sobel 边缘特征图代替原始像素（文字页面上更精确，一行错位也能检测到）
-    - NCC 归一化互相关（亮度/对比度不变，抗亚像素渲染差异）
-    - Lowe ratio test（最佳峰值必须明显超过次佳，否则拒绝——抗重复模式）
+    流程（取代旧的单峰+排序第2名 Lowe）：
+      1. Sobel-y 边缘图上做逐行滑动 NCC（等价 cv2.matchTemplate 竖直搜索），
+         取前 K=5 个互相间隔的独立峰作为候选——重复版式上周期错位峰会有
+         接近的 NCC 分数，单看最高分无法区分；
+      2. 每个候选 ±3 行用"重叠区顶部 band"的像素 SAD 仲裁：顶部 band 是刚从
+         prev 尾部滚出的内容，错一个周期则文本必然不同、SAD 必然大，比全
+         重叠区平均更抗周期欺骗；
+      3. 模板自适应上移：prev 底部若是纯色留白(Sobel 能量≈0)，模板向上挪到
+         有内容的窗口，否则 NCC 分母为 0 匹配必败。
+
+    wheel_prior: 两次抓帧之间滚轮里程表累计位移(帧物理像素)。>0 时搜索窗收窄到
+    先验±20 行(单位已由自标定换算成帧像素)，周期错位峰被先验直接排除；
+    先验超过帧高说明中间必有内容未被抓到 → 返回 0(断链)，绝不错误匹配。
+
+    旧实现的教训（/tmp 基准回放实锤）：
+      - 排序第2名 Lowe 比较的是紧邻行而非独立次峰，歧义匹配全部放行；
+      - win=80 物理行(约1/3条消息)在重复版式上到处能匹配上。
     """
     import numpy as np
     import cv2
 
+    # 滚轮先验超帧高 → 内容必然跳过，宁可断链不可错配
+    if wheel_prior >= Hp:
+        return 0
+
     pa = np.frombuffer(prev_bytes, dtype=np.uint8).reshape(Hp, W, 4)
     na = np.frombuffer(new_bytes, dtype=np.uint8).reshape(Hn, W, 4)
+    pg = pa[:, :, :3].astype(np.float32) @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    ng = na[:, :, :3].astype(np.float32) @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
-    # 灰度
-    prev_gray = cv2.cvtColor(pa, cv2.COLOR_RGBA2GRAY)
-    new_gray = cv2.cvtColor(na, cv2.COLOR_RGBA2GRAY)
+    # Sobel-y 边缘（文字行水平边缘敏感）
+    pe = cv2.Sobel(pg, cv2.CV_32F, 0, 1, ksize=3)
+    ne = cv2.Sobel(ng, cv2.CV_32F, 0, 1, ksize=3)
+    pe = np.clip(np.abs(pe), 0, 255)
+    ne = np.clip(np.abs(ne), 0, 255)
 
-    # Sobel 边缘特征（文字行检测更精确）
-    prev_edge = cv2.Sobel(prev_gray, cv2.CV_32F, 0, 1, ksize=3)
-    new_edge = cv2.Sobel(new_gray, cv2.CV_32F, 0, 1, ksize=3)
-    # 归一化到 0-255
-    prev_edge = np.clip(prev_edge, 0, 255).astype(np.uint8)
-    new_edge = np.clip(new_edge, 0, 255).astype(np.uint8)
-
-    # 模板：prev 底部自适应高度
-    win = max(20, min(Hp // 4, 80))
-    tmpl = prev_edge[Hp - win:]  # (win, W)
-
-    # matchTemplate 在 new_edge 中搜索模板
-    res = cv2.matchTemplate(new_edge, tmpl, cv2.TM_CCOEFF_NORMED)
-    # res shape: (Hn - win + 1, W - W + 1) = (Hn - win + 1, 1) → 只关心 y 方向
-    res_flat = res.flatten()  # 每个位置 y 的 NCC 分数
-
-    if len(res_flat) == 0:
+    # 大模板：盖住约 2-3 条消息（旧版 80 行太小，重复版式上歧义）
+    win = max(60, min(Hp // 3, Hp - 8))
+    if win >= Hn:
         return 0
 
-    # 找最佳和次佳
-    sorted_idx = np.argsort(res_flat)[::-1]  # 降序
-    best_y = sorted_idx[0]
-    best_val = res_flat[best_y]
-    second_val = res_flat[sorted_idx[1]] if len(sorted_idx) > 1 else 0
+    # 模板自适应上移：跳过底部纯色留白带
+    t_start = Hp - win
+    energy = pe.mean(axis=1)
+    tail_blank = 0
+    for r in range(Hp - 1, max(0, Hp - win - 1), -1):
+        if energy[r] < 0.5:
+            tail_blank += 1
+        else:
+            break
+    if tail_blank:
+        t_start = max(0, Hp - win - tail_blank)
+    tmpl = pe[t_start:t_start + win]
+    if tmpl.shape[0] < win:
+        tmpl = pe[:win]
+        t_start = 0
 
-    # Lowe ratio test：最佳必须明显超过次佳（差值 > 0.05）
-    if best_val - second_val < 0.05:
-        return 0  # 歧义匹配，拒绝
-
-    # NCC 分数太低
-    if best_val < 0.5:
+    # 逐行 NCC 曲线（cv2.matchTemplate 竖直一维搜索语义）
+    res = cv2.matchTemplate(ne.astype(np.float32), tmpl.astype(np.float32), cv2.TM_CCOEFF_NORMED)
+    res = res.flatten()
+    if len(res) == 0:
         return 0
 
-    # best_y = 模板在 new 中的起始行
-    # → 滚动量 = (Hp - win) - best_y
-    scroll_px = (Hp - win) - best_y
-    if scroll_px <= 0:
-        return max(0, Hp - 1)
+    # 前 K 个独立峰（互相间隔 min_dist，模拟"抑制邻域后取次峰"的正确 Lowe）
+    peaks = []
+    r = res.copy()
+    # 滚轮先验有效时只信先验±20行内的峰(先验换算成模板位置: cand_y ≈ t_start - wheel)
+    if wheel_prior > 0:
+        center = t_start - wheel_prior
+        lo = max(0, int(round(center)) - 20)
+        hi = min(len(r), int(round(center)) + 21)
+        if hi <= lo:
+            # 先验落在搜索范围之外 → 无有效候选(如先验≈帧高时 center 为负,
+            # 之前 r[0:负数] 的切片 bug 会返回垃圾窗口导致周期错配)
+            return 0
+        r = r[lo:hi]
+    for _ in range(5):
+        if len(r) == 0:
+            break
+        i = int(np.argmax(r))
+        if r[i] < 0.3:
+            break
+        peaks.append((i if wheel_prior <= 0 else lo + i, float(r[i])))
+        r[max(0, i - 20):i + 20] = -2
+    if not peaks:
+        return 0
 
-    # 像素精确微调：在 NCC 最佳位置 ±2 行用全像素 SAD 找最精确值
-    pa_rgb = pa[:, :, :3].astype(np.int32)
-    na_rgb = na[:, :, :3].astype(np.int32)
-    tmpl_rgb = pa_rgb[Hp - win:]
-    best_diff = float('inf')
-    best_y_fine = best_y
-    for delta in range(-2, 3):
-        pos = best_y + delta
-        if pos < 0 or pos + win > Hn:
+    # 候选仲裁：每个峰 ±3 行，用重叠区顶部 band 的像素 SAD 裁决
+    best = None  # (sad, ov)
+    top_band = max(30, win // 3)
+    for cand_y, _ncc in peaks:
+        scroll = t_start - cand_y
+        if scroll <= 0:
             continue
-        d = np.abs(na_rgb[pos:pos + win] - tmpl_rgb).mean()
-        if d < best_diff:
-            best_diff = d
-            best_y_fine = pos
-
-    scroll_px = (Hp - win) - best_y_fine
-    if scroll_px <= 0:
-        return max(0, Hp - 1)
-    overlap = Hp - scroll_px
-    overlap = max(0, min(overlap, Hp))
-    # [诊断]
-    try:
-        import pathlib
-        p = pathlib.Path("/tmp/stitch_ov.log")
-        prev_t = p.read_text(encoding="utf-8") if p.exists() else ""
-        p.write_text(prev_t + f"ov={overlap} keep={Hp-overlap} ncc={best_val:.3f} ratio_gap={best_val-second_val:.3f}\n", encoding="utf-8")
-    except Exception:
-        pass
-    return overlap
+        ov0 = Hp - scroll
+        for d in range(-3, 4):
+            ov = ov0 + d
+            if not (10 <= ov <= min(Hp, Hn) - 2):
+                continue
+            band = min(top_band, ov)
+            sad = float(np.abs(ng[:band] - pg[Hp - ov:Hp - ov + band]).mean())
+            if best is None or sad < best[0]:
+                best = (sad, ov)
+    if best is None or best[0] > 15:
+        return 0
+    return best[1]
 
 
 
-
-
-def _find_scroll_overlap(psig, nsig, Hp, Hn, prev_bytes, new_bytes, W, col_stride):
-    """求相邻两帧重叠行数(对外保留旧签名，内部走 numpy NCC)。
-
-    若 numpy 不可用或 NCC 失败，返回 0(调用方整帧追加，安全降级)。
-    """
-    try:
-        ov = _find_scroll_overlap_np(prev_bytes, new_bytes, W, Hp, Hn)
-    except Exception:
-        ov = 0
-    return ov
-
-
-
-
-def _stitch_images(images):
+def _stitch_images(images, wheel_priors=None):
     """拼接 QImage 列表为长图(基于内容重叠检测，自动去除相邻帧重复部分)。
 
     纯函数：不访问 self、不触碰 QPixmap，仅对 QImage/字节做计算，返回
     已 detach 的 QImage，因此可在工作线程里安全调用。
+    wheel_priors: 与 images 等长的列表，wheel_priors[i] 是"第 i 帧抓取时刻
+    到上一保存帧之间"的滚轮累计位移(物理像素，向下为正)。用作匹配先验。
     """
     if not images:
         return QImage()
@@ -258,55 +253,114 @@ def _stitch_images(images):
         h = items[0][2]
         return QImage(items[0][0], W, h, row_size, QImage.Format.Format_RGBA8888).copy()
 
-    col_stride = max(1, W // 32)
-    # 预计算每帧行签名(宽度一致才计算)
-    sigs = [_row_color_sums(data, W, _h, row_size, col_stride) if w == W else None
-            for (data, w, _h) in items]
-
     result_bytes = bytearray(items[0][0])
     result_h = items[0][2]
 
+    # 链式拼接：匹配对象永远是"最后一个已拼接帧"。匹配失败(ov==0，常见于
+    # 30ms 内滚动 <10px 的慢速帧)不推进 prev，等下一帧把累积位移一起补回；
+    # 连续失败超过预算才断链一次(整帧追加 + 推进)，保证内容永不为零丢失。
+    prev_idx = 0
+    fail_streak = 0
+    FAIL_BUDGET = 2
+    # 滚轮读数自标定：wheel_priors 传入的是里程表原始读数(设备单位——鼠标是
+    # 行、触控板/自动滚动是像素、符号还随"自然滚动"设置翻转)，不能直接当
+    # 帧像素用。策略：标定完成前全窗搜索，每次成功匹配用「原始读数累计 /
+    # 真实位移(prev_h-ov)」收集样本，3 个样本后定出 scale=帧px/原始单位；
+    # 之后先验 = raw×scale。符号也由 scale 吸收(翻号设备 scale 为负,乘积
+    # 仍正确)。失败/跳帧期间 raw 持续累计(位移是累积的)，断链才清零。
+    raw_acc = 0.0
+    scale = None
+    calib_raw = 0.0
+    calib_px = 0.0
+    calib_n = 0
+    calib_ratios = []  # 每样本 px/raw，离群剔除后取中位数
     for i in range(1, len(items)):
-        prev_bytes, _pw, prev_h = items[i - 1]
+        prev_bytes, _pw, prev_h = items[prev_idx]
         new_bytes, new_w, new_h = items[i]
-        # 宽度不一致或缺签名 → 容错直接拼接
-        if new_w != W or sigs[i] is None or sigs[i - 1] is None:
+
+        ov = 0
+        prior_px = 0
+        if new_w == W:
+            if wheel_priors and 0 <= i < len(wheel_priors):
+                raw_acc += wheel_priors[i] or 0
+            if scale is not None and abs(raw_acc) >= 2.0:
+                prior_px = int(round(raw_acc * scale))
+
+        # 先验证明内容已跳过(prior≥prev帧高 → 重叠为负) → 立即断链：
+        # 此时匹配空间内不存在正解，任何"成功"都是错配；整帧追加保住
+        # 新帧内容，比等 3 连败断链少丢 2 帧。
+        if prior_px >= prev_h:
             result_bytes.extend(new_bytes)
             result_h += new_h
+            prev_idx = i
+            fail_streak = 0
+            raw_acc = 0
             continue
 
-        ov = _find_scroll_overlap(
-            sigs[i - 1], sigs[i], prev_h, new_h,
-            prev_bytes, new_bytes, W, col_stride
-        )
+        if new_w == W:
+            try:
+                ov = _find_scroll_overlap_np(prev_bytes, new_bytes, W, prev_h, new_h, wheel_prior=prior_px)
+            except Exception:
+                ov = 0
         keep = new_h - ov
+
         if ov == 0 or keep < 10:
+            fail_streak += 1
+            # raw 不清零：失败帧的位移累积到下一次匹配
+            if fail_streak > FAIL_BUDGET:
+                # 断链：整帧追加一次，prev 推进（宁可少量重复，不可丢内容）
+                result_bytes.extend(new_bytes)
+                result_h += new_h
+                prev_idx = i
+                fail_streak = 0
+                raw_acc = 0  # 断链后里程与内容不再对应，重新累计
             continue
+
+        # 匹配成功 → 收集标定样本(仅在尚未标定、本段确有滚轮读数时)。
+        # 单帧错配会把比例带偏 → 逐样本记录 px/raw，标定时剔除离群(与
+        # 中位数偏差>30% 的丢弃)再取中位数，抗单点污染。
+        if scale is None and abs(raw_acc) >= 2.0:
+            calib_raw += raw_acc
+            calib_px += float(prev_h - ov)
+            calib_n += 1
+            calib_ratios.append(float(prev_h - ov) / raw_acc)
+            if calib_n >= 3 and abs(calib_raw) >= 8.0:
+                ratios = sorted(calib_ratios)
+                med = ratios[len(ratios) // 2]
+                keep_r = [r for r in ratios if abs(r - med) <= max(0.3 * abs(med), 0.5)]
+                scale = sum(keep_r) / len(keep_r) if keep_r else med
+        raw_acc = 0  # 先验已消耗
+
         # 拼接处渐变混合（消除亚像素偏移导致的黑线/错位）：
-        # 在 ov 行前 4 行做线性过渡，从 prev 内容渐变到 new 内容
-        blend_rows = min(4, ov // 2)
-        if blend_rows > 0 and ov > blend_rows:
-            import numpy as np
-            blend_start = ov - blend_rows
-            # prev 底部 blend_rows 行（已在 result 中）
-            prev_tail_start = len(result_bytes) - blend_rows * row_size
-            prev_tail = np.frombuffer(
-                bytes(result_bytes[prev_tail_start:]), dtype=np.uint8).astype(np.int32)
-            # new 对应的行
-            new_blend = np.frombuffer(
-                new_bytes[blend_start * row_size : ov * row_size],
-                dtype=np.uint8).astype(np.int32)
-            if len(prev_tail) == len(new_blend):
-                # 线性混合：alpha 从 1.0(prev) 渐变到 0.0(new)
-                for br in range(blend_rows):
-                    a = 1.0 - br / blend_rows  # 1.0 → 0.0
-                    s = br * row_size
-                    e = (br + 1) * row_size
-                    mixed = (prev_tail[s:e] * a + new_blend[s:e] * (1 - a)).astype(np.uint8)
-                    result_bytes[prev_tail_start + s : prev_tail_start + e] = mixed.tobytes()
-        # 追加 new 中重叠行之后的新内容（跳过第 0 行——可能是截图边缘伪影）
+        # 在 ov 行前 4 行做线性过渡，从 prev 内容渐变到 new 内容。
+        # 注意：只有当 prev 就是物理上一帧时才有意义；链式跳帧后 ov 对应
+        # 的"prev 尾部"可能已不在 result 末尾(中间隔了断链帧)——此时跳过混合。
+        if prev_idx == i - 1:
+            blend_rows = min(4, ov // 2)
+            if blend_rows > 0 and ov > blend_rows:
+                import numpy as np
+                blend_start = ov - blend_rows
+                # prev 底部 blend_rows 行（已在 result 中）
+                prev_tail_start = len(result_bytes) - blend_rows * row_size
+                prev_tail = np.frombuffer(
+                    bytes(result_bytes[prev_tail_start:]), dtype=np.uint8).astype(np.int32)
+                # new 对应的行
+                new_blend = np.frombuffer(
+                    new_bytes[blend_start * row_size : ov * row_size],
+                    dtype=np.uint8).astype(np.int32)
+                if len(prev_tail) == len(new_blend):
+                    # 线性混合：alpha 从 1.0(prev) 渐变到 0.0(new)
+                    for br in range(blend_rows):
+                        a = 1.0 - br / blend_rows  # 1.0 → 0.0
+                        s = br * row_size
+                        e = (br + 1) * row_size
+                        mixed = (prev_tail[s:e] * a + new_blend[s:e] * (1 - a)).astype(np.uint8)
+                        result_bytes[prev_tail_start + s : prev_tail_start + e] = mixed.tobytes()
+        # 追加 new 中重叠行之后的新内容
         result_bytes.extend(new_bytes[ov * row_size:])
-        result_h += (new_h - ov)
+        result_h += keep
+        prev_idx = i
+        fail_streak = 0
 
     return QImage(
         bytes(result_bytes), W, result_h, row_size, QImage.Format.Format_RGBA8888
@@ -495,24 +549,26 @@ class _ScrollDimOverlay(QWidget):
 
 
 class _ScrollCaptureWorker(QObject):
-    """滚轮事件驱动的抓帧（macshot 方案）。
+    """固定间隔抓帧 + 滚轮事件里程表。
 
-    用 NSEvent global monitor 监听滚轮事件：
-    - 滚轮事件触发 → 150ms 节流抓帧（避免一次滚动抓太多帧）
-    - 滚动停止 300ms 后 → 抓最后一帧（确保画面稳定）
-    - 不滚动时不抓帧（天然内容驱动，帧间重叠由用户滚动节奏决定）
-    需要「输入监控」权限。
+    抓帧：30ms 一帧（主线程做去重，静止帧自动过滤）。
+    滚轮里程表：NSEvent global monitor 累计两次抓帧之间的滚轮原始读数
+    (设备单位：鼠标≈行、触控板=像素，符号随"自然滚动"设置)，随帧一起
+    上报。拼接时自标定换算成帧像素后把 NCC 搜索窗收窄到先验±20 行。
+    需要「输入监控」权限；无权限时 wheel_px=0，匹配回退全窗搜索。
+
+    注意：monitor 必须装在有 NSRunLoop 的线程(主线程)才可能收到回调——
+    在工作线程里装等于死监听(之前先验恒为 0 的原因)。跨线程读写
+    _wheel_accum 靠 GIL，偶发丢/重一个 tick 由自标定+±20 容差吸收。
     """
-    frame_captured = pyqtSignal(bytes, int, int, int, int)  # data, x, y, w, h
+    frame_captured = pyqtSignal(bytes, int, int, int, int, int)  # data, x, y, w, h, wheel_px
 
     def __init__(self, rect):
         super().__init__()
         self._rect = QRect(rect)
         self._running = True
+        self._wheel_accum = 0       # 两次抓帧间累计滚轮位移(行, 向下为正)
         self._scroll_monitor = None
-        self._scroll_active = False  # 当前是否在滚动
-        self._scroll_start_time = 0  # 滚动开始时间（第一次事件）
-        self._last_capture_time = 0  # 最后一次抓帧的时间戳
 
     def run(self):
         from core.screenshot import Screenshot
@@ -530,16 +586,20 @@ class _ScrollCaptureWorker(QObject):
                 bits = img.bits()
                 bits.setsize(img.sizeInBytes())
                 data = bytes(bits)
+                # 取走里程表读数并发送(主线程里用)
+                wheel_px = self._wheel_accum
+                self._wheel_accum = 0
                 self.frame_captured.emit(
                     data, self._rect.x(), self._rect.y(),
-                    img.width(), img.height()
+                    img.width(), img.height(), wheel_px
                 )
             except Exception:
                 pass
             _thread_sleep(0.03)  # 30ms 固定间隔（去重逻辑过滤静止帧）
 
     def _install_scroll_monitor(self):
-        """装 NSEvent global scrollWheel monitor。"""
+        """装 NSEvent global scrollWheel monitor（滚轮里程表）。
+        必须在主线程调用——NSEvent monitor 依赖所属线程的 RunLoop 派发。"""
         import sys as _sys
         if _sys.platform != "darwin":
             return
@@ -547,29 +607,21 @@ class _ScrollCaptureWorker(QObject):
             from AppKit import NSEvent, NSEventMaskScrollWheel
         except Exception:
             return
-        import time as _time
         try:
             def on_scroll(event):
-                now = _time.monotonic()
-                if not self._scroll_active:
-                    self._scroll_active = True
-                    self._scroll_start_time = now
-                self._scroll_last_event = now
-                # [诊断] 确认滚轮事件被接收
                 try:
-                    import pathlib
-                    p = pathlib.Path("/tmp/scroll_events.log")
-                    prev = p.read_text(encoding="utf-8") if p.exists() else ""
-                    p.write_text(prev + f"scroll @ {now:.2f}\n", encoding="utf-8")
+                    # 原始读数直接累计——单位(行/像素)和符号(自然滚动设置)
+                    # 都不假设，由拼接时的"真实位移/原始读数"自标定吸收。
+                    dy = event.scrollingDeltaY()
+                    if dy:
+                        self._wheel_accum += dy
                 except Exception:
                     pass
-
             self._scroll_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
                 NSEventMaskScrollWheel, on_scroll
             )
-            print(f"滚轮监听器已安装: {self._scroll_monitor is not None}")
-        except Exception as e:
-            print(f"滚轮监听器安装失败: {e}")
+        except Exception:
+            self._scroll_monitor = None
 
     def stop(self):
         self._running = False
@@ -1867,13 +1919,7 @@ class SelectionWindow(QWidget):
             self.update()
 
     def eventFilter(self, obj, event):
-        """事件过滤器 - 处理文字输入框回车 + 滚动模式空格键。"""
-        # 滚动模式：空格键切换自动滚动
-        if (event.type() == event.Type.KeyPress
-                and event.key() == Qt.Key.Key_Down
-                and getattr(self, '_scroll_mode', False)):
-            self._toggle_auto_scroll()
-            return True
+        """事件过滤器 - 处理文字输入框回车。"""
         # 文字输入框回车
         if obj == getattr(self, 'text_input', None):
             if event.type() == event.Type.KeyPress:
@@ -3776,6 +3822,8 @@ class SelectionWindow(QWidget):
         self.is_scroll_capturing = True
         self.scroll_capture_rect = QRect(self.selection_rect)  # 保存屏幕坐标
         self.scroll_frames = []
+        self.scroll_wheel_priors = []   # 每保存帧的滚轮先验(物理px)
+        self._wheel_pending = 0         # 未归属到保存帧的滚轮位移累计
         self.scroll_no_change_count = 0
         self.scroll_last_bytes = None
         self.scroll_last_sample = None
@@ -3869,21 +3917,22 @@ class SelectionWindow(QWidget):
 
         layout = QHBoxLayout(self.scroll_capture_bar)
         layout.setContentsMargins(12, 4, 12, 4)
-        self.scroll_status_label = QLabel("按↓键自动滚动 | 已捕获 0 帧")
+        self.scroll_status_label = QLabel("滚动内容，或点自动滚动 | 0 帧")
+        self.auto_scroll_btn = QPushButton("▶ 自动滚动")
+        self.auto_scroll_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.auto_scroll_btn.clicked.connect(self._toggle_auto_scroll)
         done_btn = QPushButton("完成")
         done_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         done_btn.clicked.connect(self._finish_scroll_capture)
         layout.addWidget(self.scroll_status_label)
         layout.addStretch()
+        layout.addWidget(self.auto_scroll_btn)
         layout.addWidget(done_btn)
 
         # 自动滚动状态
         self._auto_scrolling = False
         self._auto_scroll_timer = None
-
-        # 空格键切换自动滚动（给浮窗加 eventFilter）
-        self.scroll_capture_bar.installEventFilter(self)
-        self._scroll_mode = True  # 标记滚动模式，eventFilter 检查
+        self._auto_bottom_count = 0
 
         # 定位到"捕获区域所在屏幕"的顶部居中(多显示器下跟随用户当前屏幕)
         scr = QGuiApplication.screenAt(self.scroll_capture_rect.center()) or QApplication.primaryScreen()
@@ -3891,6 +3940,11 @@ class SelectionWindow(QWidget):
         x = sg.left() + (sg.width() - 280) // 2
         self.scroll_capture_bar.move(x, sg.top() + 20)
         self.scroll_capture_bar.show()
+        # 关键：转成"非激活浮动面板"。普通 Tool 窗口点击按钮时会激活 Shorts
+        # 抢走前台焦点——用户滚轮/合成滚轮事件全都送不到目标应用(此前"点了
+        # 自动滚动但面板不动"的直接原因之一)。non-activating panel 点击不抢
+        # 焦点，目标应用保持前台，滚动直达。
+        make_floating_panel(self.scroll_capture_bar)
 
     def _start_scroll_timer(self):
         """启动子线程高频抓帧。
@@ -3905,121 +3959,183 @@ class SelectionWindow(QWidget):
         self._scroll_worker.moveToThread(self._scroll_thread)
         self._scroll_thread.started.connect(self._scroll_worker.run)
         self._scroll_worker.frame_captured.connect(self._on_scroll_frame_captured)
+        # 滚轮里程表装在主线程(NSEvent monitor 需要主线程 RunLoop 派发回调;
+        # 在工作线程装是死监听)。worker 只跨线程读 _wheel_accum。
+        self._scroll_worker._install_scroll_monitor()
         self._scroll_thread.start()
 
     def _toggle_auto_scroll(self):
-        """空格键切换自动滚动。"""
-        import pathlib
-        try:
-            p = pathlib.Path("/tmp/space_key.log")
-            prev = p.read_text(encoding="utf-8") if p.exists() else ""
-            p.write_text(prev + f"SPACE toggled: is_scroll_capturing={self.is_scroll_capturing} auto={self._auto_scrolling}\n", encoding="utf-8")
-        except Exception:
-            pass
+        """切换自动滚动模式(浮窗按钮触发，不依赖键盘焦点)。
+
+        原理：程序掌控滚动节奏——每步滚一小段像素 → 轮询等画面稳定
+        (连续两次抓帧差异<0.5% 或超时) → 稳定帧由抓帧线程自然捕获 → 下一步。
+        每帧重叠恒定 ≥85%，任何"速度"下拼接都无歧义(速度被压到匹配能力内)。
+        """
         if not getattr(self, 'is_scroll_capturing', False):
             return
         if self._auto_scrolling:
-            # 停止自动滚动
             self._auto_scrolling = False
             if self._auto_scroll_timer:
                 self._auto_scroll_timer.stop()
                 self._auto_scroll_timer = None
+            self.auto_scroll_btn.setText("▶ 自动滚动")
+            self.scroll_no_change_count = 0  # 恢复静止自动完成
             self.scroll_status_label.setText(
-                f"已暂停 | 已捕获 {len(self.scroll_frames)} 帧 | ↓键继续，点完成结束")
+                f"已暂停 | {len(self.scroll_frames)} 帧 | 点完成结束")
         else:
-            # 开始自动滚动
+            # 一旦用户表达自动滚动意图，先关掉静止自动完成——否则滚轮没生效
+            # 时 1.2s 静止计数会把会话掐掉(权限提示都来不及看)
+            self.scroll_no_change_count = -10000
+            # 发送合成滚轮事件需要「辅助功能」权限；「输入监控」只管监听。
+            # 无权限时 CGEventPost 静默失败(表面现象: 点击后画面不动,
+            # 1.2s 静止后自动完成截图)。提前检测并明确提示，别让用户猜。
+            if is_macos():
+                try:
+                    from ApplicationServices import AXIsProcessTrusted
+                    _trusted = AXIsProcessTrusted()
+                    try:
+                        import pathlib
+                        with open("/tmp/auto_scroll.log", "a", encoding="utf-8") as f:
+                            f.write(f"toggle: ax_trusted={_trusted} frames={len(self.scroll_frames)}\n")
+                    except Exception:
+                        pass
+                    if not _trusted:
+                        self._show_scroll_tip(
+                            "自动滚动需要「辅助功能」权限\n"
+                            "系统设置 → 隐私与安全性 → 辅助功能\n"
+                            "添加并开启 Shorts 后再点一次", 6000)
+                        return
+                except Exception as e:
+                    try:
+                        import pathlib
+                        with open("/tmp/auto_scroll.log", "a", encoding="utf-8") as f:
+                            f.write(f"toggle EXC: {e}\n")
+                    except Exception:
+                        pass
             self._auto_scrolling = True
-            self.scroll_status_label.setText(
-                f"自动滚动中 | 已捕获 {len(self.scroll_frames)} 帧 | ↓键暂停")
-            # 抓第一帧（当前画面）
-            self._auto_scroll_capture_frame()
-            # 每 400ms 滚动 + 抓帧
-            self._auto_scroll_timer = QTimer(self)
-            self._auto_scroll_timer.timeout.connect(self._auto_scroll_step)
-            self._auto_scroll_timer.start(400)
+            self._auto_bottom_count = 0
+            self.auto_scroll_btn.setText("⏸ 暂停")
+            self._auto_scroll_step()
+
+    def _show_scroll_tip(self, text, msec=3000):
+        """滚动截图浮窗附近显示临时提示。"""
+        from PyQt6.QtWidgets import QLabel
+        lbl = QLabel(text)
+        lbl.setWindowFlag(Qt.WindowType.FramelessWindowHint |
+                          Qt.WindowType.WindowStaysOnTopHint)
+        lbl.setStyleSheet(
+            "background-color:rgba(20,20,25,230);color:white;padding:10px 16px;"
+            "border-radius:8px;font-size:13px;")
+        lbl.adjustSize()
+        scr = QGuiApplication.screenAt(self.scroll_capture_rect.center()) \
+            or QApplication.primaryScreen()
+        sg = scr.geometry()
+        lbl.move(sg.left() + (sg.width() - lbl.width()) // 2,
+                 sg.top() + 60)
+        lbl.show()
+        lbl.raise_()
+        QTimer.singleShot(msec, lbl.close)
+        return lbl
 
     def _auto_scroll_step(self):
-        """自动滚动一步：发送滚轮事件 → 等画面稳定 → 抓帧。"""
-        if not self._auto_scrolling:
+        """自动滚动一步：向"选区中心下方"窗口投递向下滚轮事件 → 等 160ms
+        让画面稳定(抓帧线程在跑，稳定帧会自然入库)。
+        到达底部(连续 3 步无新内容)自动停止。
+
+        两个此前不动的关键点：
+        1. 滚轮 Y 轴正值=向上滚，向下必须用**负值**；
+        2. 合成事件投到 kCGHIDEventTap 时，系统把它送给"光标下的窗口"——
+           刚点完按钮光标停在悬浮条上，事件全喂给悬浮条了。投递前把光标
+           挪到选区中心，让事件落到真正的滚动面板上。
+        """
+        if not getattr(self, '_auto_scrolling', False):
             return
-        try:
-            import pathlib
-            p = pathlib.Path("/tmp/space_key.log")
-            prev = p.read_text(encoding="utf-8") if p.exists() else ""
-            p.write_text(prev + f"STEP: sending scroll event\n", encoding="utf-8")
-        except Exception:
-            pass
-        # 发送滚轮事件（向下滚 3 个 notch）
+        before = len(self.scroll_frames)
         if is_macos():
             try:
                 from Quartz import (CGEventCreateScrollWheelEvent,
                                     kCGScrollEventUnitPixel,
-                                    CGEventPost, kCGHIDEventTap)
-                # 创建滚轮事件（3 个 notch 向下）
-                event = CGEventCreateScrollWheelEvent(None, kCGScrollEventUnitPixel, 1, 3)
+                                    CGEventPost, kCGHIDEventTap,
+                                    CGEventCreateMouseEvent,
+                                    kCGEventMouseMoved,
+                                    CGPoint)
+                # 双保险：按钮点击即便意外激活了 Shorts(普通 Tool 窗口的默认
+                # 行为)，每步先强制把前台交还给目标应用，合成滚轮才能送达
+                activate_foreground_app()
+                # 光标挪到选区中心(逻辑坐标)：事件才会派发给选区下的面板
+                c = self.scroll_capture_rect.center()
+                move = CGEventCreateMouseEvent(
+                    None, kCGEventMouseMoved, CGPoint(c.x(), c.y()), 0)
+                CGEventPost(kCGHIDEventTap, move)
+                # 负值 = 向下滚。像素单位: 40px/步(选区帧高的 ~15%)
+                event = CGEventCreateScrollWheelEvent(
+                    None, kCGScrollEventUnitPixel, 1, -40)
                 CGEventPost(kCGHIDEventTap, event)
-            except Exception:
-                pass
+                # 诊断日志(区分"事件没发出"还是"发了没效果")
+                try:
+                    import pathlib, time as _t
+                    with open("/tmp/auto_scroll.log", "a", encoding="utf-8") as f:
+                        f.write(f"{_t.time():.2f} step: frames={len(self.scroll_frames)}\n")
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    import pathlib
+                    with open("/tmp/auto_scroll.log", "a", encoding="utf-8") as f:
+                        f.write(f"EXC {e}\n")
+                except Exception:
+                    pass
         else:
             import pyautogui
-            pyautogui.scroll(-3)
+            pyautogui.scroll(-4)
 
-        # 等 200ms 画面稳定后抓帧
-        QTimer.singleShot(200, self._auto_scroll_capture_frame)
+        def _check():
+            if not getattr(self, '_auto_scrolling', False):
+                return
+            if len(self.scroll_frames) == before:
+                # 本步没产生新帧 → 可能到底了
+                self._auto_bottom_count += 1
+                if self._auto_bottom_count >= 3:
+                    self._auto_scrolling = False
+                    self.auto_scroll_btn.setText("▶ 自动滚动")
+                    self.scroll_no_change_count = 0  # 恢复静止自动完成
+                    self.scroll_status_label.setText(
+                        f"已到底部 | {len(self.scroll_frames)} 帧 | 点完成结束")
+                    return
+            else:
+                self._auto_bottom_count = 0
+                self.scroll_status_label.setText(
+                    f"自动滚动中 | {len(self.scroll_frames)} 帧")
+            self._auto_scroll_step()
+
+        # 160ms 后检查并走下一步(稳定帧在 30ms 抓帧节奏下 2-3 帧内出现)
+        QTimer.singleShot(160, _check)
 
     def _auto_scroll_capture_frame(self):
-        """抓一帧（自动滚动模式）。"""
-        try:
-            shot = Screenshot()
-            frame = shot.capture_region(
-                self.scroll_capture_rect.x(), self.scroll_capture_rect.y(),
-                self.scroll_capture_rect.width(), self.scroll_capture_rect.height(),
-                use_2x=True
-            )
-            img = frame.toImage().convertToFormat(QImage.Format.Format_RGBA8888).copy()
-            bits = img.bits()
-            bits.setsize(img.sizeInBytes())
-            data = bytes(bits)
+        """(保留空实现兼容 _finish_scroll_capture 清理路径)"""
+        pass
 
-            # 去重检查
-            if self.scroll_last_bytes and len(self.scroll_last_bytes) == len(data):
-                diff = _bytes_diff_ratio(self.scroll_last_bytes, data)
-                if diff < 0.005:
-                    # 内容没变（可能到底了）
-                    self.scroll_no_change_count += 1
-                    if self.scroll_no_change_count >= 5:
-                        # 连续 5 次没变化 → 自动停止
-                        self._auto_scrolling = False
-                        if self._auto_scroll_timer:
-                            self._auto_scroll_timer.stop()
-                        self.scroll_status_label.setText(
-                            f"已到底部 | 已捕获 {len(self.scroll_frames)} 帧 | 点完成结束")
-                    return
-                self.scroll_no_change_count = 0
+    def _on_scroll_frame_captured(self, data, x, y, w, h, wheel_px=0):
+        """主线程：接收子线程抓到的帧，做去重/保存。wheel_px 是自上一保存帧
+        以来滚轮里程表累计原始读数(设备单位，行或像素，符号随设备/设置)。"""
+        # 无论是否保存，位移都在累计——去重跳过的帧的滚动量属于"下一保存帧"
+        self._wheel_pending = getattr(self, "_wheel_pending", 0) + (wheel_px or 0)
 
-            self.scroll_frames.append(QPixmap.fromImage(img))
-            self.scroll_last_bytes = data
-            self.scroll_no_change_count = 0
-            if self.scroll_status_label:
-                self.scroll_status_label.setText(
-                    f"自动滚动中 | 已捕获 {len(self.scroll_frames)} 帧 | ↓键暂停")
-        except Exception:
-            pass
-
-    def _on_scroll_frame_captured(self, data, x, y, w, h):
-        """主线程：接收子线程抓到的帧，做去重/保存。"""
         last_saved = self.scroll_last_bytes
         if last_saved is not None and len(last_saved) == len(data):
             diff = _bytes_diff_ratio(last_saved, data)
-            if diff < 0.015:  # 变化 <2% 视为未显著滚动，跳过
+            if diff < 0.005:  # 变化 <0.5% 视为未显著滚动，跳过
                 # 内容未显著变化 → 累计静止次数
                 self.scroll_no_change_count += 1
                 if self.scroll_no_change_count >= 40:  # ~静止 1.6s → 自动结束
                     self._finish_scroll_capture()
                 return
-        # 有变化 → 保存(转 QPixmap 供后续拼接)
+        # 有变化 → 保存(转 QPixmap 供后续拼接)。同时记录本帧的滚轮原始读数
+        # (拼接时自标定 scale 把它换算成帧像素，这里不做任何单位假设)
         img = QImage(data, w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
         self.scroll_frames.append(QPixmap.fromImage(img))
+        self.scroll_wheel_priors.append(int(round(self._wheel_pending)))
+        self._wheel_pending = 0
         self.scroll_last_bytes = data
         self.scroll_no_change_count = 0
         if self.scroll_status_label:
@@ -4038,7 +4154,15 @@ class SelectionWindow(QWidget):
         bg = self.background_pixmap
         if bg is None or bg.isNull():
             return
-        sub = bg.copy(self.selection_rect)
+        # bg 设了 DPR（物理像素 2x），copy 需按物理坐标裁剪
+        dpr = bg.devicePixelRatio() or 1.0
+        phys_rect = QRect(
+            round(self.selection_rect.x() * dpr),
+            round(self.selection_rect.y() * dpr),
+            round(self.selection_rect.width() * dpr),
+            round(self.selection_rect.height() * dpr),
+        )
+        sub = bg.copy(phys_rect)
         # 临时提示
         tip = self._show_float_tip("识别中…")
         QApplication.processEvents()
@@ -4452,7 +4576,6 @@ class SelectionWindow(QWidget):
         self.finished.emit()
 
     def _finish_scroll_capture(self):
-        self._scroll_mode = False
         self._auto_scrolling = False
         if getattr(self, "_auto_scroll_timer", None):
             self._auto_scroll_timer.stop()
@@ -4526,7 +4649,11 @@ class SelectionWindow(QWidget):
 
         # 主线程同步拼接(_stitch_images 是纯 QImage 计算，无 QPixmap/线程依赖)
         images = [pm.toImage() for pm in frames]
-        result = _stitch_images(images)
+        priors = getattr(self, "scroll_wheel_priors", None)
+        if priors and len(priors) == len(images):
+            result = _stitch_images(images, wheel_priors=priors)
+        else:
+            result = _stitch_images(images)
         self._on_stitch_finished(result)
 
     def _on_stitch_finished(self, image):
