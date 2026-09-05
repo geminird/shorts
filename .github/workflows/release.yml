@@ -5,6 +5,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# GITHUB_TOKEN 需要写权限才能给 tag 创建/更新 Release 并上传资产
+permissions:
+  contents: write
+
 jobs:
   build-macos:
     runs-on: macos-14
