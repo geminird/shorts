@@ -9,3 +9,5 @@ __test_*.out
 .DS_Store
 .claude/
 output.log
+core/stitch_helper
+core/stitch_helper.swift
