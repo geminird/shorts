@@ -1,5 +1,7 @@
 # Shorts · 截图标注工具
 
+[English](README-en.md)
+
 跨平台截图标注工具（macOS / Windows），Python + PyQt6 单代码库。区域 / 窗口 / 全屏 / 滚动长截图、GIF 与 MP4 录制、OCR、十余种标注工具。
 
 ## 下载
